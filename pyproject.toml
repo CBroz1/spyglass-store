@@ -1,0 +1,60 @@
+[build-system]
+build-backend = "hatchling.build"
+
+requires = [ "hatchling>=1.26.3,<2" ]
+
+[project]
+name = "template-python"
+description = "Your project description here."
+readme = "docs/src/index.md"
+license = "MIT"
+authors = [ { name = "Chris Broz" } ]
+requires-python = ">=3.10,<3.14"
+classifiers = [
+  "Natural Language :: English",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
+dynamic = [ "version" ]
+
+dependencies = [  ]
+urls.Homepage = "https://github.com/CBroz1/template-python"
+urls.Repository = "https://github.com/CBroz1/template-python"
+
+[tool.hatch.build.targets.sdist]
+include = [ "src", "tests" ]
+
+[tool.hatch.build.targets.wheel]
+packages = [ "src/template_python" ]
+
+[tool.hatch.version]
+path = "src/template_python/__init__.py"
+
+[tool.ruff]
+src = [ "src", "tests" ]
+
+format.docstring-code-format = true
+lint.extend-select = [ "I", "UP" ]
+lint.isort.known-first-party = [ "src", "tests" ]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+minversion = "6.0"
+testpaths = [ "tests" ]
+
+[tool.coverage.report]
+exclude_lines = [ "if TYPE_CHECKING:", "pragma: no cover" ]
+fail_under = 70
+show_missing = true
+
+[tool.coverage.run]
+command_line = "-m pytest"
+source_pkgs = [ "template_python", "tests" ]
+
+[tool.coverage.paths]
+template_python = [ "src/template_python" ]
+tests = [ "tests" ]

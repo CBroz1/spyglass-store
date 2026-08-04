@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["[0-9]+.[0-9]+.[0-9]+*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          python-version: ${{ matrix.python-version }}
+          environment-file: environment.yml
+          activate-environment: template-python
+          auto-update-conda: false
+          auto-activate-base: false
+          cache-downloads: true
+          cache-environment: true
+      - name: Test that Git tag version and Python package version match
+        if: github.ref_type == 'tag' && matrix.python-version == '3.12'
+        run: |
+          GIT_TAG_VERSION=$GITHUB_REF_NAME
+          PACKAGE_VERSION=$(python -c "import template_python; print(template_python.__version__)")
+          echo "The Python package version is $PACKAGE_VERSION."
+          echo "The Git tag version is $GIT_TAG_VERSION."
+          if [ "$PACKAGE_VERSION" = "$GIT_TAG_VERSION" ]; then
+            echo "Versions match."
+          else
+            echo "Versions do not match." && exit 1
+          fi
+      - name: Check code quality
+        run: |
+          ruff check
+          ruff format --check
+      - name: Run tests
+        run: coverage run
+      - name: Enforce test coverage
+        run: coverage report
+      - name: Build Python package
+        if: github.ref_type == 'tag' && matrix.python-version == '3.12'
+        run: |
+          pip install build --quiet
+          python -m build
+      - name: Publish Python package to PyPI
+        if: github.ref_type == 'tag' && matrix.python-version == '3.12'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_TOKEN }}
