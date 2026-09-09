@@ -1,17 +1,22 @@
-name: template-python
+name: spyglass-store
 channels:
   - conda-forge
 dependencies:
+  # matches requires-python in pyproject.toml and the CI matrix
   - python>=3.10,<3.14
   - pip
   - pip:
       # package (editable install)
       - -e .
       # checks
+      # Capped to the minor pinned in .pre-commit-config.yaml. ruff is pre-1.0
+      # and its formatter output shifts between minor releases, so a newer
+      # local ruff would reformat files that the hook then reformats back.
       - ruff>=0.15,<0.16
       # docs
-      - mkdocs-material>=9,<10
+      - mkdocs-material>=9
       # tests
-      - coverage[toml]>=7,<8
-      - packaging>=21,<25
-      - pytest>=8.1.1,<9
+      - coverage[toml]>=7
+      - packaging
+      - pytest>=8
+      - pyyaml

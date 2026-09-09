@@ -1,0 +1,80 @@
+"""Object layout and the storage adapter interface.
+
+Objects are content-addressed: the key is derived from the file's SHA-256, so
+identical bytes occupy one object no matter how many times they are registered.
+That gives deduplication, integrity checking, and immutability for free, and it
+means a regenerated analysis file that hashes identically is *proven* identical
+rather than assumed.
+
+Human-readable names live in the registry (see `schema.py`), not in the key, so
+naming conventions can be reorganized without moving a single object.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Protocol, runtime_checkable
+
+#: Layout version. Bump only for a change that would strand existing objects.
+LAYOUT_VERSION = "v1"
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def object_key(sha256: str) -> str:
+    """Return the object-store key for a content hash.
+
+    Two levels of fan-out keep any single prefix from accumulating the whole
+    corpus, which matters for stores that shard or list by prefix.
+
+    Parameters
+    ----------
+    sha256 : str
+        Lowercase hex digest, 64 characters.
+
+    Returns
+    -------
+    str
+        Key of the form ``spyglass/v1/ab/cd/abcd...``.
+
+    Raises
+    ------
+    ValueError
+        If the digest is not 64 lowercase hex characters.
+
+    Examples
+    --------
+    >>> object_key("a" * 64)
+    'spyglass/v1/aa/aa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    """
+    if not _SHA256_RE.match(sha256):
+        raise ValueError(
+            f"Expected a 64-character lowercase hex digest, got: {sha256!r}"
+        )
+
+    return "/".join(
+        ["spyglass", LAYOUT_VERSION, sha256[:2], sha256[2:4], sha256]
+    )
+
+
+@runtime_checkable
+class ObjectStore(Protocol):
+    """An S3-compatible object store.
+
+    Kept deliberately small: the broker only needs to know whether an object
+    exists, hand out time-limited URLs for it, and accept an upload. Anything
+    richer would tie us to one implementation, and the choice among Ceph RGW,
+    SeaweedFS, and Garage is meant to stay reversible.
+    """
+
+    def exists(self, key: str) -> bool:
+        """Return True if an object is present at `key`."""
+        ...
+
+    def presigned_get(self, key: str, ttl_seconds: int) -> str:
+        """Return a time-limited URL for reading `key`."""
+        ...
+
+    def presigned_put(self, key: str, ttl_seconds: int) -> str:
+        """Return a time-limited URL for writing `key`."""
+        ...

@@ -43,7 +43,7 @@ activate the project environment:
 
 ```sh
 conda env create -f environment.yml
-conda activate template-python
+conda activate spyglass-store
 ```
 
 To update the environment after changes to _environment.yml_:
@@ -118,7 +118,7 @@ Actions are grouped into workflows and stored in _.github/workflows_.
 - **PRs should be merged into the default branch.** Head branches are deleted
     automatically after PRs are merged.
 - **To create a release:**
-  - Bump the version number in `src/template_python/__init__.py` and commit
+  - Bump the version number in `src/spyglass_store/__init__.py` and commit
         the changes.
   - Follow [SemVer](https://semver.org/) and
     [PEP 440](https://peps.python.org/pep-0440/) guidelines when choosing a

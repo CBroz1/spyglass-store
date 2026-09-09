@@ -1,0 +1,288 @@
+openapi: 3.1.0
+
+info:
+  title: spyglass-store broker
+  version: 1.0.0
+  description: |
+    Permission and metering broker for shared NWB file storage.
+
+    The broker never serves file bytes. It authenticates a GitHub identity,
+    decides whether that identity may read a file, and issues a short-lived
+    presigned URL to the object store. Once issued, the broker is out of the
+    data path and cannot revoke or meter the transfer, which is why URL
+    lifetimes are short and quota is charged at issue time.
+
+    This document is the contract. The Spyglass client validates against it in
+    CI, and this repository contract-tests against the released client. The
+    path is versioned so a broker upgrade never breaks pinned clients, which
+    matters more than usual because we do not control when users upgrade.
+  license:
+    name: MIT
+
+servers:
+  - url: https://{host}/api/v1
+    variables:
+      host:
+        default: localhost:8000
+
+security:
+  - bearerAuth: []
+
+paths:
+  /auth/device:
+    post:
+      summary: Begin GitHub device flow
+      description: |
+        Returns a code the user types at GitHub. No callback server is needed,
+        so this works over SSH and inside Docker.
+      security: []
+      operationId: beginDeviceFlow
+      responses:
+        "200":
+          description: Device and user codes
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceCode"
+
+  /auth/token:
+    post:
+      summary: Exchange a device code for a broker token
+      security: []
+      operationId: exchangeDeviceCode
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device_code]
+              properties:
+                device_code:
+                  type: string
+      responses:
+        "200":
+          description: Broker token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Token"
+        "428":
+          description: Authorization still pending; keep polling
+        "403":
+          description: Account rejected, for example below the minimum age
+
+  /file/resolve:
+    get:
+      summary: Resolve a name or hash to a file id
+      operationId: resolveFile
+      parameters:
+        - name: name
+          in: query
+          schema:
+            type: string
+          description: Spyglass file name. One of name or sha256 is required.
+        - name: sha256
+          in: query
+          schema:
+            $ref: "#/components/schemas/Sha256"
+      responses:
+        "200":
+          description: Matching file
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/File"
+        "403":
+          description: Not readable by this identity
+        "404":
+          description: No such file
+
+  /file:
+    post:
+      summary: Register an upload
+      description: |
+        Records the file and returns a presigned URL to write the object.
+        Registering a hash that already exists deduplicates: the existing
+        object is reused and no upload URL is returned.
+      operationId: registerFile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FileRegistration"
+      responses:
+        "201":
+          description: Registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadTarget"
+        "403":
+          description: This tier may not upload
+        "429":
+          $ref: "#/components/responses/Throttled"
+
+  /file/{file_id}/content:
+    get:
+      summary: Stable content URL
+      description: |
+        Redirects to a freshly signed URL. The client holds this stable URL, so
+        an expiring signature never leaks into a long-running analysis: each
+        range request re-follows the redirect and gets a fresh signature.
+      operationId: getFileContent
+      parameters:
+        - name: file_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "302":
+          description: Redirect to the object store
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+        "403":
+          description: Not readable by this identity
+        "404":
+          description: No such file
+        "429":
+          $ref: "#/components/responses/Throttled"
+
+  /file/{file_id}/visibility:
+    patch:
+      summary: Change who may read a file
+      description: Owner only. Takes effect immediately, with no re-upload.
+      operationId: setVisibility
+      parameters:
+        - name: file_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Visibility"
+      responses:
+        "200":
+          description: Updated
+        "403":
+          description: Not the owner
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+
+  responses:
+    Throttled:
+      description: Quota or rate limit reached
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds to wait. Clients back off with jitter.
+
+  schemas:
+    Sha256:
+      type: string
+      pattern: "^[0-9a-f]{64}$"
+
+    DeviceCode:
+      type: object
+      required: [device_code, user_code, verification_uri, interval, expires_in]
+      properties:
+        device_code:
+          type: string
+        user_code:
+          type: string
+          description: Shown to the user to type at GitHub.
+        verification_uri:
+          type: string
+          format: uri
+        interval:
+          type: integer
+          description: Minimum seconds between polls.
+        expires_in:
+          type: integer
+
+    Token:
+      type: object
+      required: [access_token, tier]
+      properties:
+        access_token:
+          type: string
+        tier:
+          type: string
+          enum: [unverified, verified, trusted, admin]
+        github_login:
+          type: string
+
+    File:
+      type: object
+      required: [file_id, sha256, size_bytes, spyglass_name, file_class]
+      properties:
+        file_id:
+          type: string
+        sha256:
+          $ref: "#/components/schemas/Sha256"
+        size_bytes:
+          type: integer
+          format: int64
+        spyglass_name:
+          type: string
+        file_class:
+          type: string
+          enum: [raw, analysis]
+
+    FileRegistration:
+      type: object
+      required: [sha256, size_bytes, spyglass_name, file_class]
+      properties:
+        sha256:
+          $ref: "#/components/schemas/Sha256"
+        size_bytes:
+          type: integer
+          format: int64
+        spyglass_name:
+          type: string
+        file_class:
+          type: string
+          enum: [raw, analysis]
+        visibility:
+          $ref: "#/components/schemas/Visibility"
+
+    UploadTarget:
+      type: object
+      required: [file_id, deduplicated]
+      properties:
+        file_id:
+          type: string
+        deduplicated:
+          type: boolean
+          description: True when the object already existed; no upload needed.
+        upload_url:
+          type: string
+          format: uri
+          description: Absent when deduplicated.
+
+    Visibility:
+      type: object
+      required: [scope]
+      properties:
+        scope:
+          type: string
+          enum: [private, group, public]
+        teams:
+          type: array
+          description: LabTeam names. Used when scope is group.
+          items:
+            type: string

@@ -6,8 +6,8 @@ markdown_extensions:
   - pymdownx.details
   - pymdownx.inlinehilite
   - pymdownx.magiclink:
-      user: CBroz1
-      repo: template-python
+      user: LorenFrankLab
+      repo: spyglass-store
       repo_url_shorthand: true
   - pymdownx.snippets
   - pymdownx.superfences
@@ -19,10 +19,9 @@ markdown_extensions:
       toc_depth: 3
 nav:
   - "index.md"
-  - "examples.md"
-repo_name: CBroz1/template-python
-repo_url: https://github.com/CBroz1/template-python
-site_name: template-python docs
+repo_name: LorenFrankLab/spyglass-store
+repo_url: https://github.com/LorenFrankLab/spyglass-store
+site_name: spyglass-store docs
 site_url: ""
 theme:
   favicon: assets/images/favicon.png

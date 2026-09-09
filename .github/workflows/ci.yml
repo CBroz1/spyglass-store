@@ -25,7 +25,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           environment-file: environment.yml
-          activate-environment: template-python
+          activate-environment: spyglass-store
           auto-update-conda: false
           auto-activate-base: false
           cache-downloads: true
@@ -34,7 +34,7 @@ jobs:
         if: github.ref_type == 'tag' && matrix.python-version == '3.12'
         run: |
           GIT_TAG_VERSION=$GITHUB_REF_NAME
-          PACKAGE_VERSION=$(python -c "import template_python; print(template_python.__version__)")
+          PACKAGE_VERSION=$(python -c "import spyglass_store; print(spyglass_store.__version__)")
           echo "The Python package version is $PACKAGE_VERSION."
           echo "The Git tag version is $GIT_TAG_VERSION."
           if [ "$PACKAGE_VERSION" = "$GIT_TAG_VERSION" ]; then

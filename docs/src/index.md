@@ -1,125 +1,89 @@
-# template-python
+# spyglass-store
 
-## Description
+Permission and metering broker for shared NWB file storage.
 
-**Welcome!** This is a template repository for Python projects using the same
-tools that are used to manage
-[Spyglass](https://github.com/LorenFrankLab/spyglass). Click
-"[Use this template](https://github.com/new?template_name=template-python&template_owner=CBroz1)"
-to create your own repository from this template, then follow the
-[quickstart](#quickstart) below.
+## What it is
+
+`spyglass-store` lets researchers share NWB files with per-file and per-team
+permissions, without anyone managing cloud credentials. It sits between the
+Spyglass client and a self-hosted S3-compatible object store.
+
+The broker holds the only credentials that can write to the bucket. It
+authenticates a GitHub identity, decides whether that identity may read a file,
+and issues a short-lived presigned URL. **It never serves file bytes** — once
+the URL is issued, the broker is out of the data path, so a multi-terabyte read
+never flows through it.
+
+```
+Spyglass client  ──►  BROKER  ──►  object store
+  (laptop, HPC)         │          (Ceph RGW, SeaweedFS, Garage)
+                        ▼
+                 ServerHost MySQL
+              (broker schema + LabTeam)
+```
+
+## Why a broker, rather than bucket credentials
+
+1. **Keys.** Users must not manage cloud keys. The bar is "run one command,
+    paste a code."
+2. **Permissions.** S3 bucket policies cannot express "team X may read these
+    4,000 files" without exceeding policy size limits.
+3. **Throttling.** Uploads and downloads need one chokepoint for metering and
+    audit.
+
+## Scope
+
+The broker stores hashes, sizes, owners, and access rules. It does not model
+sessions, subjects, or pipelines — that is Spyglass's job. Teams are read from
+Spyglass's `LabTeam` rather than duplicated, so admins curate membership in one
+place.
+
+It shares the ServerHost MySQL instance with Spyglass but owns a separate
+schema. That means one availability domain: a client already needs that
+instance to discover which files exist, so the broker is a permission and
+metering service rather than an independent identity provider.
+
+The Spyglass-side client is **not** here. It ships inside `spyglass` as
+`spyglass.sharing.store`, so researchers run one `pip install`. Only the server
+lives in this repository, because its audience is database admins rather than
+researchers, and because web-service dependencies have no business in a
+scientific conda environment.
 
 ## Project structure
 
 ```
-template-python/
-├── .github/                 # issue templates, PR template, CONTRIBUTING.md
-├── .gitignore               # ignored files and directories
-├── .pre-commit-config.yaml  # linting and formatting hooks
-├── CHANGELOG.md             # version history
-├── LICENSE                  # MIT license
-├── README.md                # this file (symlink to docs/src/index.md)
-├── docs/                    # documentation
-│   ├── mkdocs.yml           # mkdocs configuration
-│   └── src/                 # mkdocs source files
-├── environment.yml          # conda environment
-├── notebooks/               # example Jupyter notebooks
-├── pyproject.toml           # package metadata and tool config
-├── src/template_python/     # library source code
-└── tests/                   # pytest test suite
+spyglass-store/
+├── deploy/                  # docker-compose, later helm
+├── docs/                    # operator documentation
+├── openapi.yaml             # the API contract, source of truth
+├── src/spyglass_store/
+│   ├── broker/              # FastAPI service
+│   ├── cli/                 # admin CLI
+│   ├── schema.py            # DataJoint tables
+│   ├── settings.py          # environment configuration
+│   └── storage.py           # object layout, store adapter
+└── tests/
 ```
 
-## Quickstart
+## API contract
 
-### 1. Rename the template
+`openapi.yaml` is the contract for both this service and the Spyglass client.
+The path is versioned so a broker upgrade never breaks pinned clients, which
+matters more than usual because we do not control when users upgrade Spyglass.
 
-Replace the placeholder names throughout the repo with your own:
-
-```sh
-# set your names
-repo_name="your-repo-name"
-your_name="Your Name"
-your_user="YourGitHubUsername"
-
-# rename the source package directory
-git mv "src/template_python" "src/${repo_name//-/_}"
-
-# replace placeholder strings across all files
-git grep -l "CBroz1"       | xargs sed -i "s|CBroz1|$your_user|g"
-git grep -l "Chris Broz"   | xargs sed -i "s|Chris Broz|$your_name|g"
-git grep -l "template_python" | xargs sed -i "s|template_python|${repo_name//-/_}|g"
-git grep -l "template-python" | xargs sed -i "s|template-python|$repo_name|g"
-```
-
-### 2. Create the conda environment
-
-This makes an isolated environment with all the dependencies needed to run the
-code and tests.
+## Development
 
 ```sh
 conda env create -f environment.yml
-conda activate $repo_name
-```
-
-Alternatively, you can update an existing environment with:
-
-```sh
-conda activate myenv
-conda env update --file environment.yml --prune
-```
-
-### 3. Install pre-commit hooks
-
-This is a one-time setup step to install tools that will run automatic checks on
-your edits before you commit them. You can customize the hooks in
-`.pre-commit-config.yaml`.
-
-```sh
+conda activate spyglass-store
 pre-commit install
-```
-
-Hooks run automatically before each commit. To run them manually:
-
-```sh
-pre-commit run --all-files
-```
-
-### 4. Run tests
-
-Tests help ensure your code is working as expected when you make changes.
-Example tests in `tests/` use the [pytest](https://docs.pytest.org/) framework.
-You can run the test suite with:
-
-```sh
 pytest
 ```
 
-If you see failed tests, you may want to rerun the test with debugging enabled:
-
 ```sh
-pytest --pdb -v tests/test_your_module.py -k test_your_function
-```
-
-### 5. Build and serve docs locally
-
-[`mkdocs`](https://www.mkdocs.org/getting-started/) is a static website
-generator for documentation that can be automatically deployed as a
-[GitHub Page](https://www.mkdocs.org/user-guide/deploying-your-docs/).
-
-```sh
-# serve with live reload
+# serve docs with live reload
 mkdocs serve -f docs/mkdocs.yml
-
-# build static site
-mkdocs build -f docs/mkdocs.yml
 ```
-
-You can customize the documentation by editing the markdown files in `docs/src/`
-and the configuration in `docs/mkdocs.yml`. Various extensions can even
-automatically generate API reference documentation from your source code (e.g.,
-[`mkdocs-gen-files`](https://github.com/oprypin/mkdocs-gen-files)) or auto-run
-your notebooks to show as web pages (e.g.,
-[`mkdocs-jupyter`](https://github.com/danielfrg/mkdocs-jupyter)).
 
 ## Resources
 
@@ -127,8 +91,4 @@ your notebooks to show as web pages (e.g.,
 - [pre-commit](https://pre-commit.com/) — Git hook framework for code quality
 - [pytest](https://docs.pytest.org/) — Python testing framework
 - [Material for MkDocs](https://squidfunk.github.io/mkdocs-material/) —
-  documentation site generator
-- GitHub docs:
-  [forking a repo](https://docs.github.com/en/get-started/quickstart/fork-a-repo),
-  [branching](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/proposing-changes-to-your-work-with-pull-requests/about-branches),
-  [opening a pull request](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/proposing-changes-to-your-work-with-pull-requests/about-pull-requests)
+    documentation site generator
