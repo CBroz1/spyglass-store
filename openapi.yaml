@@ -93,10 +93,14 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/File"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           description: Not readable by this identity
         "404":
           description: No such file
+        "422":
+          description: Neither name nor sha256 was given
 
   /file:
     post:
@@ -119,6 +123,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/UploadTarget"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           description: This tier may not upload
         "429":
@@ -146,6 +152,15 @@ paths:
               schema:
                 type: string
                 format: uri
+            Cache-Control:
+              schema:
+                type: string
+              description: |
+                Always no-store. The stable URL works because every request
+                re-signs; a cached redirect would replay a signature past its
+                expiry and fail mid-session.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           description: Not readable by this identity
         "404":
@@ -173,6 +188,8 @@ paths:
       responses:
         "200":
           description: Updated
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           description: Not the owner
 
@@ -183,6 +200,18 @@ components:
       scheme: bearer
 
   responses:
+    Unauthorized:
+      description: |
+        Missing, malformed, or unrecognized bearer token.
+
+        Distinct from 403: this means the caller was never identified, so
+        retrying with a valid token may succeed. A 403 means the identity is
+        known and refused, and retrying will not help.
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+
     Throttled:
       description: Quota or rate limit reached
       headers:

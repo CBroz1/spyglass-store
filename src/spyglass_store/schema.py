@@ -44,7 +44,7 @@ class Account(dj.Manual):
     lab_member_name=null : varchar(80)   # null for unaffiliated readers
     tier='unverified'    : enum('unverified','verified','trusted','admin')
     github_created       : date          # for the minimum-age check
-    created              : timestamp default current_timestamp
+    created=CURRENT_TIMESTAMP : timestamp
     unique index (github_id)
     """
 
@@ -61,7 +61,7 @@ class File(dj.Manual):
     spyglass_name : varchar(255)  # name the client knows it by
     file_class    : enum('raw','analysis')
     -> Account.proj(owner='account_id')
-    registered    : timestamp default current_timestamp
+    registered=CURRENT_TIMESTAMP : timestamp
     index (sha256)
     index (spyglass_name)
     """
@@ -81,7 +81,7 @@ class FileAccess(dj.Manual):
     principal_type : enum('account','team','public')
     principal      : varchar(80)   # account_id, LabTeam name, or '' if public
     ---
-    granted        : timestamp default current_timestamp
+    granted=CURRENT_TIMESTAMP : timestamp
     """
 
 
@@ -102,6 +102,6 @@ class AccessLog(dj.Manual):
     granted     : bool
     size_bytes=0: bigint      # charged at URL-issue time; a lower bound
     source_ip   : varchar(45) # IPv6-safe
-    timestamp   : timestamp default current_timestamp
+    timestamp=CURRENT_TIMESTAMP : timestamp
     index (account_id, timestamp)
     """

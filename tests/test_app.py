@@ -48,20 +48,27 @@ class _Verifier:
 
 
 class _Store:
-    """Records what was presigned and returns a fixed URL."""
+    """Records what was presigned and returns a fixed URL.
+
+    `has_object` flips whether the content is already stored, which is what
+    decides deduplication on the registration path.
+    """
 
     def __init__(self):
         self.presigned = []
+        self.put_presigned = []
+        self.has_object = False
 
     def presigned_get(self, key, ttl_seconds):
         self.presigned.append((key, ttl_seconds))
         return f"https://objects.example.org/{key}?sig=abc"
 
-    def exists(self, key):  # pragma: no cover - unused on the read path
-        return True
+    def exists(self, key):
+        return self.has_object
 
-    def presigned_put(self, key, ttl):  # pragma: no cover - unused here
-        return ""
+    def presigned_put(self, key, ttl):
+        self.put_presigned.append((key, ttl))
+        return f"https://objects.example.org/{key}?sig=put"
 
 
 @pytest.fixture
@@ -86,8 +93,45 @@ def client(store):
         patch("spyglass_store.registry.file_by_name", side_effect=_by_name),
         patch("spyglass_store.registry.file_by_sha256", side_effect=_by_sha),
         patch("spyglass_store.registry.rules_for_file", side_effect=_rules),
+        patch(
+            "spyglass_store.registry.registration_for",
+            side_effect=_registration_for,
+        ),
+        patch(
+            "spyglass_store.registry.register_file", side_effect=_register_file
+        ),
     ):
         yield TestClient(app)
+
+
+#: Registrations made through the route, keyed by (sha256, name, owner).
+_REGISTERED: dict = {}
+
+
+def _registration_for(sha256, name, owner):
+    return _REGISTERED.get((sha256, name, owner))
+
+
+def _register_file(
+    *, sha256, size_bytes, spyglass_name, file_class, owner, rules=()
+):
+    record = FileRecord(
+        file_id=f"id{len(_REGISTERED)}",
+        sha256=sha256,
+        size_bytes=size_bytes,
+        spyglass_name=spyglass_name,
+        file_class=file_class,
+        owner=owner,
+    )
+    _REGISTERED[(sha256, spyglass_name, owner)] = record
+    return record
+
+
+@pytest.fixture(autouse=True)
+def _clear_registrations():
+    _REGISTERED.clear()
+    yield
+    _REGISTERED.clear()
 
 
 #: Grants on the one file. Rebound per test via `set_rules`.
@@ -277,3 +321,82 @@ def test_denied_read_does_not_presign(client, store):
     )
 
     assert store.presigned == []
+
+
+# ---------------------------- registration ----------------------------
+
+BODY = {
+    "sha256": "b" * 64,
+    "size_bytes": 512,
+    "spyglass_name": "new_.nwb",
+    "file_class": "raw",
+}
+
+
+def test_register_returns_an_upload_url_for_new_content(client, store):
+    """New bytes get somewhere to put them."""
+    store.has_object = False
+    r = client.post("/api/v1/file", json=BODY, headers=auth("owner"))
+
+    assert r.status_code == 201
+    body = r.json()
+    assert body["deduplicated"] is False
+    assert body["upload_url"].endswith("sig=put")
+    assert store.put_presigned == [(object_key("b" * 64), 300)]
+
+
+def test_register_deduplicates_existing_content(client, store):
+    """Bytes already stored are not uploaded again.
+
+    This is the ST-1.4 acceptance: a duplicate hash reuses the object rather
+    than storing it twice.
+    """
+    store.has_object = True
+    r = client.post("/api/v1/file", json=BODY, headers=auth("owner"))
+
+    assert r.status_code == 201
+    assert r.json()["deduplicated"] is True
+    assert r.json()["upload_url"] is None
+    assert store.put_presigned == []
+
+
+def test_register_is_idempotent(client, store):
+    """Retrying after a dropped response returns the same file_id."""
+    first = client.post("/api/v1/file", json=BODY, headers=auth("owner"))
+    second = client.post("/api/v1/file", json=BODY, headers=auth("owner"))
+
+    assert first.json()["file_id"] == second.json()["file_id"]
+
+
+def test_unverified_tier_may_not_upload(client):
+    """Registration writes to shared storage; the unverified tier may not."""
+    r = client.post("/api/v1/file", json=BODY, headers=auth("unverified"))
+
+    assert r.status_code == 403
+
+
+def test_unregistered_identity_may_not_upload(client):
+    """With no account there is no owner to record."""
+    r = client.post("/api/v1/file", json=BODY, headers=auth("unregistered"))
+
+    assert r.status_code == 403
+
+
+def test_group_visibility_needs_a_team(client):
+    """'group' with no teams would silently mean private."""
+    r = client.post(
+        "/api/v1/file",
+        json={**BODY, "visibility": {"scope": "group", "teams": []}},
+        headers=auth("owner"),
+    )
+
+    assert r.status_code == 422
+
+
+def test_malformed_hash_is_rejected(client):
+    """The hash is the object key; a bad one would mint an unreachable path."""
+    r = client.post(
+        "/api/v1/file", json={**BODY, "sha256": "nope"}, headers=auth("owner")
+    )
+
+    assert r.status_code == 422

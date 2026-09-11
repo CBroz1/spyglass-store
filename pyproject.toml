@@ -23,7 +23,7 @@ dynamic = [ "version" ]
 
 dependencies = [
   "boto3>=1.34",
-  "datajoint>=0.14",
+  "datajoint>=0.14.5,<2.0", # matches spyglass pin
   "fastapi>=0.115",
   "httpx>=0.27",
   "pydantic>=2.7",

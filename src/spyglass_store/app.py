@@ -16,20 +16,25 @@ receives one switches out of presigned-URL mode and rejects the request. See
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from spyglass_store import registry
-from spyglass_store.access import Reader, can_read, is_public
+from spyglass_store.access import Reader, Scope, can_read, is_public, rules_for
 from spyglass_store.auth import GitHubVerifier, Identity, require_identity
 from spyglass_store.s3 import S3ObjectStore
 from spyglass_store.settings import Settings, get_settings
 from spyglass_store.storage import object_key
 
 API_PREFIX = "/api/v1"
+
+
+#: Tiers permitted to upload. Registration writes to shared storage and
+#: charges quota, so it asks more than reading does.
+WRITE_TIERS = frozenset({"verified", "trusted", "admin"})
 
 
 class FileOut(BaseModel):
@@ -40,6 +45,33 @@ class FileOut(BaseModel):
     size_bytes: int
     spyglass_name: str
     file_class: str
+
+
+class VisibilityIn(BaseModel):
+    """Declared visibility, matching the contract's `Visibility` schema."""
+
+    scope: Literal["private", "group", "public"]
+    teams: list[str] = Field(default_factory=list)
+
+
+class FileRegistrationIn(BaseModel):
+    """A request to register an upload."""
+
+    sha256: str = Field(pattern="^[0-9a-f]{64}$")
+    size_bytes: int = Field(ge=0)
+    spyglass_name: str
+    file_class: Literal["raw", "analysis"]
+    visibility: VisibilityIn = Field(
+        default_factory=lambda: VisibilityIn(scope="private")
+    )
+
+
+class UploadTarget(BaseModel):
+    """Where to put the bytes, if they are not already there."""
+
+    file_id: str
+    deduplicated: bool
+    upload_url: str | None = None
 
 
 def current_reader(
@@ -149,6 +181,63 @@ def create_app(
         _authorize(file, identity)
 
         return FileOut(**{k: getattr(file, k) for k in FileOut.model_fields})
+
+    @app.post(
+        f"{API_PREFIX}/file",
+        response_model=UploadTarget,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def register_file(
+        body: FileRegistrationIn,
+        identity: Annotated[Identity, Depends(current_reader)],
+    ) -> UploadTarget:
+        """Register an upload and return where to write the bytes."""
+        if not identity.account_id or identity.tier not in WRITE_TIERS:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This identity may not upload.",
+            )
+
+        try:
+            rules = rules_for(
+                Scope(body.visibility.scope), body.visibility.teams
+            )
+        except ValueError as err:  # group with no teams names nobody
+            raise HTTPException(status_code=422, detail=str(err)) from err
+
+        key = object_key(body.sha256)
+
+        # Retrying a dropped response must not register the file twice, so an
+        # identical prior registration by this owner is returned as-is.
+        existing = registry.registration_for(
+            body.sha256, body.spyglass_name, identity.account_id
+        )
+
+        file = existing or registry.register_file(
+            sha256=body.sha256,
+            size_bytes=body.size_bytes,
+            spyglass_name=body.spyglass_name,
+            file_class=body.file_class,
+            owner=identity.account_id,
+            rules=rules,
+        )
+
+        # Content addressing means the object may already be present from
+        # someone else's upload. That is the deduplication: the registration is
+        # per owner, the object is shared.
+        stored = app.state.store.exists(key)
+
+        return UploadTarget(
+            file_id=file.file_id,
+            deduplicated=stored,
+            upload_url=(
+                None
+                if stored
+                else app.state.store.presigned_put(
+                    key, app.state.settings.presigned_ttl_seconds
+                )
+            ),
+        )
 
     @app.get(f"{API_PREFIX}/file/{{file_id}}/content")
     def get_file_content(

@@ -85,3 +85,21 @@ def test_throttling_tells_the_client_when_to_retry(spec: dict) -> None:
     """429 carries Retry-After so clients back off instead of failing."""
     throttled = spec["components"]["responses"]["Throttled"]
     assert "Retry-After" in throttled["headers"]
+
+
+def test_secured_operations_document_401(spec: dict) -> None:
+    """A secured endpoint has to say what an unusable token gets back.
+
+    401 and 403 are different answers: 401 means the caller was never
+    identified and a valid token may work, 403 means a known identity was
+    refused. A client that cannot tell them apart retries the wrong one.
+    """
+    missing = [
+        f"{path} {method}"
+        for path, ops in spec["paths"].items()
+        for method, op in ops.items()
+        if method in {"get", "post", "patch"}
+        and op.get("security") != []
+        and "401" not in op["responses"]
+    ]
+    assert not missing, f"secured operations without a 401: {missing}"

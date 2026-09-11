@@ -16,8 +16,12 @@ insert privilege and an unknown caller is limited to public files.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import lru_cache
+from uuid import uuid4
+
+import datajoint as dj
 
 from spyglass_store.access import AccessRule, Principal
 from spyglass_store.auth import Identity
@@ -163,6 +167,111 @@ def rules_for_file(file_id: str) -> tuple[AccessRule, ...]:
             principal=row["principal"] or "",
         )
         for row in rows
+    )
+
+
+def registration_for(
+    sha256: str, spyglass_name: str, owner: str
+) -> FileRecord | None:
+    """Return this owner's existing registration of this content, or None.
+
+    Registering is idempotent per owner and name: a client that retries after
+    a dropped response must not accumulate rows. Two *different* owners
+    registering the same bytes is not a duplicate — they each get a
+    registration, and the object is what deduplicates.
+
+    Parameters
+    ----------
+    sha256 : str
+        Content hash being registered.
+    spyglass_name : str
+        Name the client knows the file by.
+    owner : str
+        Account id registering it.
+
+    Returns
+    -------
+    FileRecord or None
+    """
+    _, File, _ = tables()
+    query = File & {
+        "sha256": sha256,
+        "spyglass_name": spyglass_name,
+        "owner": int(owner),
+    }
+
+    return _record(_one(query))
+
+
+def register_file(
+    *,
+    sha256: str,
+    size_bytes: int,
+    spyglass_name: str,
+    file_class: str,
+    owner: str,
+    rules: Iterable[AccessRule] = (),
+) -> FileRecord:
+    """Record a file and the grants its declared visibility implies.
+
+    The row and its grants go in one transaction. A file that existed with no
+    rules would be readable by its owner alone, which is the safe direction to
+    fail, but a *public* file whose grant was lost would be silently private
+    and the owner would have no signal — so neither half is written alone.
+
+    Parameters
+    ----------
+    sha256 : str
+        Content hash. Determines the object key, so it is the deduplication
+        key as well.
+    size_bytes : int
+        Declared size.
+    spyglass_name : str
+        Name the client knows the file by.
+    file_class : str
+        Either raw or analysis.
+    owner : str
+        Account id registering the file.
+    rules : iterable of AccessRule, optional
+        Grants to record. Empty for a private file.
+
+    Returns
+    -------
+    FileRecord
+        The newly registered file, with its generated `file_id`.
+    """
+    _, File, FileAccess = tables()
+    file_id = uuid4().hex
+
+    with dj.conn().transaction:
+        File.insert1(
+            {
+                "file_id": file_id,
+                "sha256": sha256,
+                "size_bytes": size_bytes,
+                "spyglass_name": spyglass_name,
+                "file_class": file_class,
+                "owner": int(owner),
+            }
+        )
+        FileAccess.insert(
+            [
+                {
+                    "file_id": file_id,
+                    "principal_type": rule.principal_type.value,
+                    "principal": rule.principal,
+                }
+                for rule in rules
+            ]
+        )
+
+    return FileRecord(
+        file_id=file_id,
+        sha256=sha256,
+        size_bytes=size_bytes,
+        spyglass_name=spyglass_name,
+        file_class=file_class,
+        owner=str(owner),
     )
 
 

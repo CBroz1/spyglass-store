@@ -17,6 +17,8 @@ dependencies:
       - mkdocs-material>=9
       # tests
       - coverage[toml]>=7
+      # database tests bring their own MySQL container
+      - docker>=7
       - packaging
       - pytest>=8
       - pyyaml
