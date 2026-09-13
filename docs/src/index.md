@@ -25,11 +25,11 @@ Spyglass client  ──►  BROKER  ──►  object store
 ## Why a broker, rather than bucket credentials
 
 1. **Keys.** Users must not manage cloud keys. The bar is "run one command,
-    paste a code."
+   paste a code."
 2. **Permissions.** S3 bucket policies cannot express "team X may read these
-    4,000 files" without exceeding policy size limits.
+   4,000 files" without exceeding policy size limits.
 3. **Throttling.** Uploads and downloads need one chokepoint for metering and
-    audit.
+   audit.
 
 ## Scope
 
@@ -39,9 +39,9 @@ Spyglass's `LabTeam` rather than duplicated, so admins curate membership in one
 place.
 
 It shares the ServerHost MySQL instance with Spyglass but owns a separate
-schema. That means one availability domain: a client already needs that
-instance to discover which files exist, so the broker is a permission and
-metering service rather than an independent identity provider.
+schema. That means one availability domain: a client already needs that instance
+to discover which files exist, so the broker is a permission and metering
+service rather than an independent identity provider.
 
 The Spyglass-side client is **not** here. It ships inside `spyglass` as
 `spyglass.sharing.store`, so researchers run one `pip install`. Only the server
@@ -53,17 +53,27 @@ scientific conda environment.
 
 ```
 spyglass-store/
-├── deploy/                  # docker-compose, later helm
-├── docs/                    # operator documentation
+├── deploy/                  # Dockerfile, docker-compose, operator guide
+├── docs/                    # documentation
 ├── openapi.yaml             # the API contract, source of truth
 ├── src/spyglass_store/
-│   ├── broker/              # FastAPI service
-│   ├── cli/                 # admin CLI
+│   ├── app.py               # the FastAPI service: all six routes
+│   ├── access.py            # the whole permission rule
+│   ├── auth.py              # bearer token -> Identity
+│   ├── github.py            # device flow, and all GitHub wire format
+│   ├── registry.py          # every database read and write
 │   ├── schema.py            # DataJoint tables
+│   ├── lab.py               # Spyglass lab tables, reflected not imported
+│   ├── storage.py           # object layout, ObjectStore protocol
+│   ├── s3.py                # the one ObjectStore implementation
+│   ├── db.py                # connection discipline
 │   ├── settings.py          # environment configuration
-│   └── storage.py           # object layout, store adapter
+│   └── cli/                 # admin CLI
 └── tests/
 ```
+
+See [Developing](developing.md) for a fuller map, the invariants a change can
+break without failing a test, and how to get a test run going.
 
 ## API contract
 
@@ -77,8 +87,16 @@ matters more than usual because we do not control when users upgrade Spyglass.
 conda env create -f environment.yml
 conda activate spyglass-store
 pre-commit install
-pytest
+
+# The suite starts its own MySQL and MinIO containers, so Docker must be
+# running. Point --container-vol-dir at a disk with room: MySQL wants a 2 GB
+# log before it starts, and Docker's default volume root is usually on `/`.
+pytest --container-vol-dir=/path/on/a/roomy/disk
 ```
+
+Tests needing a database skip cleanly when Docker is unavailable — so a green
+run on a machine without it has skipped most of the suite. See
+[Developing](developing.md).
 
 ```sh
 # serve docs with live reload
@@ -91,4 +109,4 @@ mkdocs serve -f docs/mkdocs.yml
 - [pre-commit](https://pre-commit.com/) — Git hook framework for code quality
 - [pytest](https://docs.pytest.org/) — Python testing framework
 - [Material for MkDocs](https://squidfunk.github.io/mkdocs-material/) —
-    documentation site generator
+  documentation site generator

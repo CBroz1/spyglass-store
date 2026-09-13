@@ -4,6 +4,12 @@
 
 **PRs welcome!**
 
+**Read [Developing](../docs/src/developing.md) first.** It covers getting a
+test run going — the suite starts its own Docker containers — and the
+invariants a change can break without any test failing. The most important of
+those: this package must never `import spyglass`, and the broker must never
+handle file bytes.
+
 - **Consider starting a discussion to see if there's interest in what you want
     to do.**
 - **Fork the repo and submit PRs from the fork.**

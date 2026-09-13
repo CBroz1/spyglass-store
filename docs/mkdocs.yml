@@ -19,6 +19,7 @@ markdown_extensions:
       toc_depth: 3
 nav:
   - "index.md"
+  - "developing.md"
   - "github-app.md"
 repo_name: LorenFrankLab/spyglass-store
 repo_url: https://github.com/LorenFrankLab/spyglass-store
