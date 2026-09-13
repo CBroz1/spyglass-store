@@ -6,10 +6,10 @@ that writes — registration and visibility — and anything that reflects
 Spyglass's lab tables, since reflection is precisely the thing a fake cannot
 exercise.
 
-Ordering matters more than usual here. `schema.py` calls `dj.schema()` at
-import time using a cached `Settings`, so the schema prefix and the DataJoint
-connection must both be set *before* anything imports it. The `db` fixture does
-that and then clears the caches that would otherwise pin the old values.
+The `db` fixture points DataJoint and the broker settings at the container,
+then clears the caches that would otherwise pin the previous values. The
+schema declares itself on first use rather than on import, so nothing here has
+to control when a module is imported.
 
 Spyglass's `common_lab` is created here rather than mocked. The broker reaches
 it through `dj.create_virtual_module`, and reflection against a table that does
@@ -18,6 +18,8 @@ tables have to be real for the check to mean anything.
 """
 
 from __future__ import annotations
+
+import os
 
 import pytest
 
@@ -35,6 +37,15 @@ def pytest_addoption(parser):
         help="Leave the MySQL container running after the session, so the "
         "next run skips startup. Data persists; use for iterating.",
     )
+    parser.addoption(
+        "--container-vol-dir",
+        action="store",
+        default=os.environ.get("SPYGLASS_STORE_DOCKER_VOL_DIR"),
+        help="Parent directory for container data, bind-mounted as "
+        "<dir>/<container-name>. Keeps MySQL and the object store off the "
+        "root disk, which is usually the one that runs out. Defaults to "
+        "$SPYGLASS_STORE_DOCKER_VOL_DIR.",
+    )
 
 
 @pytest.fixture(scope="session")
@@ -51,13 +62,93 @@ def container(request):
     except Exception as err:  # daemon down, no socket, no permission
         pytest.skip(f"Docker is not usable: {err}")
 
-    server = MySQLContainer(keep=request.config.getoption("--keep-container"))
+    server = MySQLContainer(
+        keep=request.config.getoption("--keep-container"),
+        vol_dir=request.config.getoption("--container-vol-dir"),
+    )
+    # Registered before `wait`, which raises on a container that will never
+    # become healthy. Without this, that raise happens before the yield, the
+    # teardown never runs, and the broken container poisons every later run
+    # until someone removes it by hand.
+    request.addfinalizer(server.stop)
     server.start()
     server.wait()
 
     yield server
 
-    server.stop()
+
+@pytest.fixture(scope="session")
+def s3_server(request):
+    """A running S3 store, or a skip if Docker is unavailable.
+
+    Separate from the MySQL fixture so a test needing only one pays for only
+    one, and so a missing Docker skips both with the same message.
+    """
+    docker = pytest.importorskip(
+        "docker", reason="object store tests need the docker SDK"
+    )
+
+    from tests.container import S3Container
+
+    try:
+        docker.from_env()
+    except Exception as err:  # daemon down, no socket, no permission
+        pytest.skip(f"Docker is not usable: {err}")
+
+    server = S3Container(
+        keep=request.config.getoption("--keep-container"),
+        vol_dir=request.config.getoption("--container-vol-dir"),
+    )
+    request.addfinalizer(server.stop)  # see the MySQL fixture
+    server.start()
+    server.wait()
+    server.create_bucket()
+    # A kept container carries objects from the last run, and content
+    # addressing means a leftover silently turns the next registration into a
+    # deduplicated one. Start every session from an empty bucket.
+    server.empty_bucket()
+
+    yield server
+
+
+@pytest.fixture
+def s3_settings(s3_server):
+    """`Settings` pointed at the container, with a short presign lifetime."""
+    from spyglass_store.settings import Settings
+
+    return Settings(presigned_ttl_seconds=300, **s3_server.settings_kwargs())
+
+
+@pytest.fixture
+def object_store(s3_settings):
+    """A real `S3ObjectStore` against the container, emptied afterwards.
+
+    Nothing here is faked: boto3 signs, MinIO verifies, and bytes move over
+    HTTP. That is the whole point — presigning is exactly the behaviour a
+    stub cannot stand in for.
+
+    The bucket is cleared between tests because the container is session
+    scoped and objects are content addressed. A leftover object makes the
+    next registration of the same bytes deduplicate, so a test would silently
+    exercise the cached path instead of the one it names.
+    """
+    from spyglass_store.s3 import S3ObjectStore
+
+    store = S3ObjectStore(s3_settings)
+
+    yield store
+
+    _empty_bucket(store._client, s3_settings.s3_bucket)
+
+
+def _empty_bucket(client, bucket: str) -> None:
+    """Delete every object in `bucket`."""
+    listed = client.list_objects_v2(Bucket=bucket)
+
+    keys = [{"Key": obj["Key"]} for obj in listed.get("Contents", [])]
+
+    if keys:
+        client.delete_objects(Bucket=bucket, Delete={"Objects": keys})
 
 
 @pytest.fixture(scope="session")
@@ -77,22 +168,20 @@ def db(container, monkeypatch_session):
 
     monkeypatch_session.setenv("SPYGLASS_STORE_SCHEMA_PREFIX", TEST_PREFIX)
 
-    from spyglass_store import lab, registry
+    from spyglass_store import lab, schema
     from spyglass_store.settings import get_settings
 
-    get_settings.cache_clear()
-    lab.lab_module.cache_clear()
-    registry.tables.cache_clear()
+    def reset():
+        get_settings.cache_clear()
+        lab.lab_module.cache_clear()
+        schema.get_schema.cache_clear()
 
+    reset()
     _declare_lab_schema(dj)
 
-    from spyglass_store import schema
+    yield schema.get_schema()
 
-    yield schema
-
-    get_settings.cache_clear()
-    lab.lab_module.cache_clear()
-    registry.tables.cache_clear()
+    reset()
 
 
 def _declare_lab_schema(dj) -> None:
@@ -100,7 +189,20 @@ def _declare_lab_schema(dj) -> None:
 
     Only the columns in `lab.REQUIRED_COLUMNS` matter; the rest are included
     so the shape matches what Spyglass actually declares.
+
+    The schema is named literally `common_lab`, and teardown deletes from it.
+    Pointed at the wrong host that is a production accident, so the host is
+    asserted first rather than trusted to whatever configured it.
     """
+    host = str(dj.config["database.host"])
+
+    if host not in {"127.0.0.1", "localhost"}:
+        raise RuntimeError(
+            f"Refusing to declare {lab_module_name()!r} against {host!r}. "
+            "These fixtures create and delete Spyglass's own lab tables, so "
+            "they may only run against a local test container."
+        )
+
     lab_schema = dj.schema(lab_module_name())
 
     @lab_schema
@@ -186,6 +288,8 @@ def broker_tables(db):
     """
     yield db.Account, db.File, db.FileAccess
 
+    db.AccessLog.delete_quick()
+    db.ClientToken.delete_quick()
     db.FileAccess.delete_quick()
     db.File.delete_quick()
     db.Account.delete_quick()

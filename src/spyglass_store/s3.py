@@ -16,6 +16,7 @@ import boto3
 from botocore.config import Config
 
 from spyglass_store.settings import Settings, get_settings
+from spyglass_store.storage import PresignedUpload, checksum_header
 
 
 class S3ObjectStore:
@@ -128,6 +129,57 @@ class S3ObjectStore:
 
         return True
 
+    def size(self, key: str) -> int | None:
+        """Return the stored size of `key`, or None if it is not there.
+
+        Read from the store rather than trusted from the client, because the
+        declared size is what quota charges and what the audit reports.
+
+        Parameters
+        ----------
+        key : str
+            Object key.
+
+        Returns
+        -------
+        int or None
+        """
+        try:
+            head = self._client.head_object(
+                Bucket=self.settings.s3_bucket, Key=key
+            )
+        except Exception as err:  # noqa: BLE001 - botocore errors vary
+            if _is_not_found(err):
+                return None
+            raise
+
+        return int(head["ContentLength"])
+
+    def iter_keys(self, prefix: str = ""):
+        """Yield every object key under `prefix`.
+
+        Not part of `ObjectStore`: reconciliation is the only caller, and a
+        listing is the one operation a store can make expensive. Keeping it
+        off the protocol means a backend that cannot list cheaply is still a
+        valid backend, and only the admin report degrades.
+
+        Parameters
+        ----------
+        prefix : str, optional
+            Key prefix to walk.
+
+        Yields
+        ------
+        str
+        """
+        paginator = self._client.get_paginator("list_objects_v2")
+
+        for page in paginator.paginate(
+            Bucket=self.settings.s3_bucket, Prefix=prefix
+        ):
+            for obj in page.get("Contents", []):
+                yield obj["Key"]
+
     def presigned_get(self, key: str, ttl_seconds: int | None = None) -> str:
         """Return a time-limited URL for reading `key`.
 
@@ -137,9 +189,53 @@ class S3ObjectStore:
         """
         return self._presign("get_object", key, ttl_seconds)
 
-    def presigned_put(self, key: str, ttl_seconds: int | None = None) -> str:
-        """Return a time-limited URL for writing `key`."""
-        return self._presign("put_object", key, ttl_seconds)
+    def presigned_put(
+        self,
+        key: str,
+        ttl_seconds: int | None = None,
+        sha256: str | None = None,
+    ) -> PresignedUpload:
+        """Return a time-limited target for writing `key`.
+
+        When `sha256` is given and checksum enforcement is on, the digest is
+        signed into the URL as a required header. The store then computes the
+        hash of what arrives and refuses a mismatch, which is the only way to
+        bind registered content to uploaded content without the broker
+        standing in the data path.
+
+        Because the requirement is part of the signature, a client cannot skip
+        it: omitting the header invalidates the request rather than waiving
+        the check.
+
+        Parameters
+        ----------
+        key : str
+            Object key to write.
+        ttl_seconds : int, optional
+            Lifetime. Defaults to the configured presign TTL.
+        sha256 : str, optional
+            Hex digest the uploaded bytes must hash to.
+
+        Returns
+        -------
+        PresignedUpload
+            URL, and the headers the client must send.
+        """
+        params = {"Bucket": self.settings.s3_bucket, "Key": key}
+        headers: dict[str, str] = {}
+
+        if sha256 and self.settings.s3_enforce_upload_checksum:
+            encoded = checksum_header(sha256)
+            params["ChecksumSHA256"] = encoded
+            headers["x-amz-checksum-sha256"] = encoded
+
+        url = self._client.generate_presigned_url(
+            "put_object",
+            Params=params,
+            ExpiresIn=ttl_seconds or self.settings.presigned_ttl_seconds,
+        )
+
+        return PresignedUpload(url, headers)
 
     def _presign(self, operation: str, key: str, ttl: int | None) -> str:
         """Sign one request."""

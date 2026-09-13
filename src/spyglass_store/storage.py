@@ -12,8 +12,9 @@ naming conventions can be reorganized without moving a single object.
 
 from __future__ import annotations
 
+import base64
 import re
-from typing import Protocol, runtime_checkable
+from typing import NamedTuple, Protocol, runtime_checkable
 
 #: Layout version. Bump only for a change that would strand existing objects.
 LAYOUT_VERSION = "v1"
@@ -57,6 +58,59 @@ def object_key(sha256: str) -> str:
     )
 
 
+class PresignedUpload(NamedTuple):
+    """Where to write an object, and what must accompany the write.
+
+    The headers are not advisory. They are covered by the signature, so a
+    client that drops them gets a refusal rather than an unverified upload.
+
+    Attributes
+    ----------
+    url : str
+        Presigned PUT URL.
+    headers : dict of str
+        Headers the client must send verbatim.
+    """
+
+    url: str
+    headers: dict[str, str]
+
+
+def checksum_header(sha256: str) -> str:
+    """Return the value S3 expects in `x-amz-checksum-sha256`.
+
+    S3 carries checksums base64 encoded, while the registry addresses objects
+    by hex digest, so the two representations have to be converted rather than
+    compared.
+
+    Parameters
+    ----------
+    sha256 : str
+        Lowercase hex digest, 64 characters.
+
+    Returns
+    -------
+    str
+        Base64 of the same digest.
+
+    Raises
+    ------
+    ValueError
+        If the digest is not 64 lowercase hex characters.
+
+    Examples
+    --------
+    >>> checksum_header("0" * 64)
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='
+    """
+    if not _SHA256_RE.match(sha256):
+        raise ValueError(
+            f"Expected a 64-character lowercase hex digest, got: {sha256!r}"
+        )
+
+    return base64.b64encode(bytes.fromhex(sha256)).decode()
+
+
 @runtime_checkable
 class ObjectStore(Protocol):
     """An S3-compatible object store.
@@ -75,6 +129,22 @@ class ObjectStore(Protocol):
         """Return a time-limited URL for reading `key`."""
         ...
 
-    def presigned_put(self, key: str, ttl_seconds: int) -> str:
-        """Return a time-limited URL for writing `key`."""
+    def size(self, key: str) -> int | None:
+        """Return the stored size of `key` in bytes, or None if absent.
+
+        The size a client declared at registration is not evidence of
+        anything. Metering against it lets an uploader register one byte for
+        a ten gigabyte object and make it free to read forever.
+        """
+        ...
+
+    def presigned_put(
+        self, key: str, ttl_seconds: int, sha256: str | None = None
+    ) -> PresignedUpload:
+        """Return a time-limited target for writing `key`.
+
+        When `sha256` is given, the store is asked to verify the uploaded
+        bytes against it, so content cannot be registered under one hash and
+        uploaded as another.
+        """
         ...

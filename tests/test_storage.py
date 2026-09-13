@@ -52,7 +52,22 @@ def test_object_store_protocol_is_structural() -> None:
         def presigned_get(self, key: str, ttl_seconds: int) -> str:
             return "https://example.invalid/get"
 
+        def size(self, key: str) -> int | None:
+            return 0
+
         def presigned_put(self, key: str, ttl_seconds: int) -> str:
             return "https://example.invalid/put"
 
     assert isinstance(Fake(), ObjectStore)
+
+
+def test_same_origin_compares_scheme_host_and_port():
+    """Origin is what decides header forwarding, not string similarity."""
+    from spyglass_store.app import same_origin
+
+    assert same_origin("https://a.org/api", "https://a.org/objects")
+    assert not same_origin("https://a.org", "https://objects.a.org")
+    assert not same_origin("https://a.org", "http://a.org")
+    assert not same_origin("https://a.org:443", "https://a.org:9000")
+    # An unset public_base_url cannot be compared, so it must not match.
+    assert not same_origin("", "https://a.org")

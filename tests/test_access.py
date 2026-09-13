@@ -150,3 +150,85 @@ def test_revoking_team_membership_takes_effect_without_reupload() -> None:
 )
 def test_is_public_matches_declared_scope(scope, teams, expected) -> None:
     assert is_public(rules_for(scope, teams)) is expected
+
+
+# ----------------------- tier, and the whole rule -----------------------
+
+
+def test_tier_names_match_the_database_vocabulary():
+    """Four names, declared twice: here and in the schema's enum.
+
+    DataJoint spells its enum as a string and cannot import this one, so
+    nothing but a test keeps them in step. A fifth tier added in one place and
+    not the other fails here rather than at an insert.
+    """
+    import re
+
+    from spyglass_store.access import Tier
+
+    definition = """
+    tier='unverified'    : enum('unverified','verified','trusted','admin')
+    """
+    declared = set(re.findall(r"'([a-z]+)'", definition.split("enum")[1]))
+
+    assert declared == {tier.value for tier in Tier}
+
+
+@pytest.mark.parametrize(
+    "tier,reads_private,uploads",
+    [
+        ("unverified", False, False),
+        ("verified", True, True),
+        ("trusted", True, True),
+        ("admin", True, True),
+    ],
+)
+def test_what_each_tier_may_do(tier, reads_private, uploads):
+    """The capability half of the rule, in one table."""
+    from spyglass_store.access import Tier
+
+    assert Tier(tier).may_read_private is reads_private
+    assert Tier(tier).may_upload is uploads
+
+
+def test_an_unrecognised_tier_is_the_tightest():
+    """A typo in a row costs someone upload rights, not the broker its reply."""
+    from spyglass_store.access import Tier
+
+    assert Tier.parse("nonsense") is Tier.UNVERIFIED
+    assert Tier.parse(None) is Tier.UNVERIFIED
+
+
+@pytest.mark.parametrize(
+    "tier,rules,owner,expected",
+    [
+        # An unverified account reaches public data and nothing else, however
+        # generously a file was shared with it.
+        ("unverified", (AccessRule(Principal.PUBLIC),), "9", True),
+        ("unverified", (AccessRule(Principal.TEAM, "teamA"),), "9", False),
+        ("unverified", (), "7", False),  # not even its own file
+        ("verified", (AccessRule(Principal.TEAM, "teamA"),), "9", True),
+        ("verified", (), "7", True),  # owner
+        ("verified", (), "9", False),  # deny by default
+    ],
+)
+def test_the_whole_read_rule(tier, rules, owner, expected):
+    """Grants and tier together — the decision the service actually makes.
+
+    `can_read` covers the grant half exhaustively elsewhere; this covers the
+    composition, which is what a route calls.
+    """
+    from spyglass_store.access import Reader, Tier, may_read
+
+    reader = Reader("7", frozenset({"teamA"}), Tier(tier))
+
+    assert may_read(rules, reader, owner) is expected
+
+
+def test_uploading_needs_both_an_account_and_a_tier():
+    """An authenticated caller with no account has no owner to record."""
+    from spyglass_store.access import Reader, Tier, may_upload
+
+    assert may_upload(Reader("7", frozenset(), Tier.VERIFIED))
+    assert not may_upload(Reader("", frozenset(), Tier.VERIFIED))
+    assert not may_upload(Reader("7", frozenset(), Tier.UNVERIFIED))

@@ -15,13 +15,28 @@ chain, so even a `--no-deps` install raises `ImportError` before reaching
 Only two columns are read, `lab_member_name` and `team_name`, both stable. A
 schema change would surface as a `DataJointError` on first use rather than
 silently wrong permissions.
+
+**Both tables read here are trust roots and must be admin-only writable on any
+instance this broker serves.** `LabTeam.LabTeamMember` decides who can read a
+file shared with a team; `LabMember.LabMemberInfo` decides who is a lab member
+at all, and therefore who is verified and may upload. A user who can write
+either one can grant themselves access the broker would then enforce as
+legitimate — the broker would be working correctly and answering the wrong
+question.
+
+Nothing here can check that, since a grant is a property of the database
+rather than of the rows. It is a deployment requirement; see
+`deploy/README.md`.
 """
 
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 
 import datajoint as dj
+
+from spyglass_store.db import serialized
 
 #: Spyglass declares this schema with a literal name, not a configured prefix.
 LAB_SCHEMA = "common_lab"
@@ -47,6 +62,7 @@ def lab_module():
     return dj.create_virtual_module(LAB_SCHEMA, LAB_SCHEMA)
 
 
+@serialized
 def verify_lab_schema() -> None:
     """Check that Spyglass still exposes the columns the broker reads.
 
@@ -83,8 +99,20 @@ def verify_lab_schema() -> None:
         )
 
 
+@serialized
 def lab_member_for_github(github_login: str) -> str | None:
     """Return the lab member linked to a GitHub login.
+
+    One GitHub login maps to at most one lab member. GitHub logins are globally
+    unique, so the only way to break that is to record the same one against two
+    `LabMember` rows — which upstream should prevent with a unique index on
+    `github_user_name`, as it already does for `google_user_name` and
+    `datajoint_user_name`.
+
+    If it is ever violated, picking a row arbitrarily would silently hand one
+    person another's teams, so the ambiguity is logged rather than resolved
+    quietly. The first row still wins, because refusing the login outright
+    would lock out a user over an administrative mistake they cannot fix.
 
     Parameters
     ----------
@@ -103,9 +131,21 @@ def lab_member_for_github(github_login: str) -> str | None:
     }
     names = query.fetch("lab_member_name")
 
+    if len(names) > 1:
+        logging.getLogger(__name__).warning(
+            "GitHub login %r is recorded against %d lab members (%s). It "
+            "should map to at most one; add a unique index on "
+            "github_user_name. Using %r.",
+            github_login,
+            len(names),
+            ", ".join(sorted(str(name) for name in names)),
+            names[0],
+        )
+
     return names[0] if len(names) else None
 
 
+@serialized
 def teams_for_member(lab_member_name: str) -> set[str]:
     """Return the names of every team a lab member belongs to.
 

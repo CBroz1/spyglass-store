@@ -103,3 +103,50 @@ def test_secured_operations_document_401(spec: dict) -> None:
         and "401" not in op["responses"]
     ]
     assert not missing, f"secured operations without a 401: {missing}"
+
+
+def test_contract_matches_the_application(spec: dict) -> None:
+    """The published contract and the running app must not drift apart.
+
+    `openapi.yaml` is hand-written and the application generates its own
+    schema, so nothing but this check keeps them in step. It is what catches
+    a documented response the code cannot actually produce — a client told to
+    handle a status that never arrives writes dead code and trusts a promise
+    the server is not keeping.
+    """
+    from spyglass_store.app import create_app
+    from spyglass_store.settings import Settings
+
+    app = create_app(
+        verifier=object(),
+        store=object(),
+        github=object(),
+        settings=Settings(),
+    )
+    live = app.openapi()["paths"]
+
+    missing = []
+    for path, ops in spec["paths"].items():
+        full = f"/api/v1{path}"
+        for method, op in ops.items():
+            if method not in {"get", "post", "patch", "put", "delete"}:
+                continue
+            served = live.get(full, {}).get(method)
+            if served is None:
+                missing.append(f"{method.upper()} {full} is not implemented")
+                continue
+            for status in op["responses"]:
+                # FastAPI only declares what a route can return by type; the
+                # error statuses come from raises it cannot see. Check the
+                # success statuses, which it does know about.
+                if (
+                    status.startswith(("2", "3"))
+                    and status not in served["responses"]
+                ):
+                    missing.append(
+                        f"{method.upper()} {full} does not document {status}"
+                    )
+
+    assert not missing, "contract and application disagree:\n  " + "\n  ".join(
+        missing
+    )

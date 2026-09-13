@@ -31,6 +31,11 @@ dependencies = [
 ]
 
 optional-dependencies.serve = [ "uvicorn>=0.30" ]
+
+# The admin CLI. Installed with the package because an operator reaches the
+# database directly rather than through the service, and needs it most when
+# the service is not running.
+scripts.spyglass-store = "spyglass_store.cli:main"
 urls.Homepage = "https://github.com/LorenFrankLab/spyglass-store"
 urls.Repository = "https://github.com/LorenFrankLab/spyglass-store"
 

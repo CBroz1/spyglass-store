@@ -1,0 +1,111 @@
+# Single-node broker, with a self-hosted object store alongside it.
+#
+# Copy `.env.example` to `.env` at the repository root and fill it in, then:
+#
+#   docker compose -f deploy/docker-compose.yml up --build
+#
+# The broker refuses to start if it cannot reach its bucket or the Spyglass
+# lab schema, so a container that comes up is one whose configuration works.
+#
+# ---------------------------------------------------------------------------
+# ONE CONSTRAINT THAT IS EASY TO BREAK
+#
+# The broker and the object store must be reachable at DIFFERENT ORIGINS.
+#
+# `GET /file/{id}/content` answers 302 to a presigned URL. Every HTTP client
+# tested keeps its `Authorization` header when a redirect stays within one
+# origin and strips it when the origin changes. An S3 store that receives that
+# header drops out of presigned-URL mode into header authentication and then
+# refuses the request, complaining about a missing `x-amz-content-sha256` —
+# which reads nothing like an authentication problem and will cost whoever
+# debugs it an afternoon.
+#
+# Below, the two services are on different ports, which is a different origin.
+# If you put a reverse proxy in front, give them different HOSTNAMES:
+#
+#   store.example.org      -> broker          GOOD
+#   objects.example.org    -> object store
+#
+#   store.example.org/api  -> broker          BROKEN: reads fail
+#   store.example.org/obj  -> object store
+#
+# Set SPYGLASS_STORE_PUBLIC_BASE_URL and the broker will warn at startup if it
+# detects this.
+# ---------------------------------------------------------------------------
+
+name: spyglass-store
+
+services:
+  store:
+    # MinIO stands in for the deployed object store. Ceph RGW, SeaweedFS, and
+    # Garage are all reachable by changing this image and the endpoint below;
+    # the broker speaks only the S3 API and knows about none of them.
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${SPYGLASS_STORE_S3_ACCESS_KEY:?set in .env}
+      MINIO_ROOT_PASSWORD: ${SPYGLASS_STORE_S3_SECRET_KEY:?set in .env}
+    volumes:
+      - objects:/data
+    ports:
+      # A distinct origin from the broker. See the note above.
+      - "9000:9000"
+      - "9001:9001"   # console; do not expose this publicly
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: the broker verifies the bucket at startup and refuses to boot
+  # without it. It deliberately does not create buckets itself — provisioning
+  # storage is an operator action, not something a web service should do with
+  # the credential it holds.
+  createbucket:
+    image: minio/mc:latest
+    depends_on:
+      store:
+        condition: service_healthy
+    environment:
+      MC_HOST_local: http://${SPYGLASS_STORE_S3_ACCESS_KEY}:${SPYGLASS_STORE_S3_SECRET_KEY}@store:9000
+    entrypoint: >
+      sh -c "mc mb --ignore-existing local/${SPYGLASS_STORE_S3_BUCKET:-spyglass-store}"
+
+  broker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    depends_on:
+      store:
+        condition: service_healthy
+      createbucket:
+        condition: service_completed_successfully
+    environment:
+      # Database: DataJoint's own variables, not broker settings. The broker
+      # deliberately does not re-declare these — an admin who can already
+      # reach the instance needs no new configuration.
+      DJ_HOST: ${DJ_HOST:?the ServerHost MySQL instance}
+      DJ_USER: ${DJ_USER:?}
+      DJ_PASS: ${DJ_PASS:?}
+
+      # Identity. Register an app per deployment; see docs/src/github-app.md.
+      SPYGLASS_STORE_GITHUB_CLIENT_ID: ${SPYGLASS_STORE_GITHUB_CLIENT_ID:?}
+
+      # Object store. `store` is the service name on the compose network, so
+      # this is a different origin from whatever the broker is published at.
+      SPYGLASS_STORE_S3_ENDPOINT_URL: http://store:9000
+      SPYGLASS_STORE_S3_BUCKET: ${SPYGLASS_STORE_S3_BUCKET:-spyglass-store}
+      SPYGLASS_STORE_S3_ACCESS_KEY: ${SPYGLASS_STORE_S3_ACCESS_KEY:?}
+      SPYGLASS_STORE_S3_SECRET_KEY: ${SPYGLASS_STORE_S3_SECRET_KEY:?}
+      SPYGLASS_STORE_S3_REGION: ${SPYGLASS_STORE_S3_REGION:-us-east-1}
+
+      # Used only for the same-origin warning described above.
+      SPYGLASS_STORE_PUBLIC_BASE_URL: ${SPYGLASS_STORE_PUBLIC_BASE_URL:-}
+
+      SPYGLASS_STORE_SCHEMA_PREFIX: ${SPYGLASS_STORE_SCHEMA_PREFIX:-store}
+      SPYGLASS_STORE_PRESIGNED_TTL_SECONDS: ${SPYGLASS_STORE_PRESIGNED_TTL_SECONDS:-300}
+    ports:
+      - "8000:8000"
+
+volumes:
+  objects:

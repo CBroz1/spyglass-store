@@ -1,40 +1,25 @@
 """Turning a bearer token into the identity a decision is made about.
 
-A token is verified by asking GitHub who it belongs to: `GET /user` returns the
-id, login, and creation date, which is everything `schema.Account` records. No
-scopes are needed, so the token a developer already has from `gh auth token`
-works, and so does the unscoped token device flow will hand out later.
+The token a client presents is issued by the broker, not by GitHub. Device
+flow (see `github.py`) establishes who someone is once; `registry.issue_token`
+then mints a credential that means nothing outside this service. Verifying it
+is a hash lookup against `ClientToken` — no network call, so GitHub being slow
+or down cannot stall a read.
 
-That makes ST-1.2 an ergonomics feature rather than a prerequisite. Device flow
-exists so a user on a headless machine can *obtain* a token without a browser;
-it is not how a token is *checked*.
-
-**The token is never stored.** It is a GitHub credential that may carry broad
-scopes, and the broker has no business holding one. Only the resulting account
-is persisted, which is what ST-1.2 means by "store the internal account, not
-the GitHub token". When the broker mints its own tokens, the routes here do not
-change: `bearerAuth` is opaque to the client either way.
+That indirection is the point of registering an OAuth app. The GitHub token is
+used once to learn a username and then dropped, so the credential the broker
+stores, logs near, and hands back can read nothing on GitHub at all. A leaked
+broker token costs its owner access to this service; a leaked `gh` token would
+have cost them their repositories.
 """
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
 
-import httpx
 from fastapi import HTTPException, Request, status
 
-#: GitHub's identity endpoint. An unscoped token still answers it.
-GITHUB_USER_URL = "https://api.github.com/user"
-
-#: How long a verified token is trusted before GitHub is asked again. Short,
-#: because a revoked token should stop working promptly; long enough that a
-#: range-request storm does not become a GitHub rate-limit problem.
-VERIFY_TTL_SECONDS = 300
-
-#: Tiers that may read beyond public files. An unverified account is limited to
-#: public data; see `min_account_age_days` in `settings.py` for why.
-READ_TIERS = frozenset({"verified", "trusted", "admin"})
+from spyglass_store.access import Reader, Tier
 
 
 @dataclass(frozen=True)
@@ -50,7 +35,8 @@ class Identity:
     account_id : str
         Broker account id. Empty until the account is looked up or created.
     tier : str
-        One of unverified, verified, trusted, admin.
+        One of unverified, verified, trusted, admin. Stored as the string the
+        database holds; `access.Tier` is the vocabulary.
     teams : frozenset of str
         `LabTeam` names this identity reads through, resolved once per request
         so `access.can_read` stays a pure function over data. Empty for an
@@ -63,78 +49,31 @@ class Identity:
     tier: str = "unverified"
     teams: frozenset[str] = field(default_factory=frozenset)
 
-    @property
-    def may_read_private(self) -> bool:
-        """True if this tier may read anything beyond public files."""
-        return self.tier in READ_TIERS
+    def as_reader(self) -> Reader:
+        """Return this identity as the subject of a permission decision.
+
+        The whole permission rule lives in `access`; this is the only place
+        that converts an authenticated caller into its input.
+        """
+        return Reader(
+            account_id=self.account_id,
+            teams=self.teams,
+            tier=Tier.parse(self.tier),
+        )
 
 
-class GitHubVerifier:
-    """Verifies a bearer token by asking GitHub who holds it.
+class TokenVerifier:
+    """Resolves a broker token through the stored hashes.
 
-    Results are cached for `VERIFY_TTL_SECONDS` keyed on the token, so a client
-    issuing many range requests costs one GitHub call per five minutes rather
-    than one per request.
+    A thin wrapper so the application has something injectable on
+    `app.state`; the work is `registry.identity_for_token`.
     """
 
-    def __init__(
-        self, client: httpx.Client | None = None, ttl: int | None = None
-    ):
-        """Build a verifier.
-
-        Parameters
-        ----------
-        client : httpx.Client, optional
-            HTTP client. Supplied by tests; a default one is built when
-            omitted.
-        ttl : int, optional
-            Cache lifetime in seconds. Defaults to `VERIFY_TTL_SECONDS`.
-        """
-        self._client = client or httpx.Client(timeout=10.0)
-        self._ttl = VERIFY_TTL_SECONDS if ttl is None else ttl
-        self._cache: dict[str, tuple[float, Identity]] = {}
-
     def verify(self, token: str) -> Identity | None:
-        """Return the identity holding `token`, or None if it is not valid.
+        """Return the identity holding `token`, or None."""
+        from spyglass_store import registry
 
-        Parameters
-        ----------
-        token : str
-            Bearer token presented by the caller.
-
-        Returns
-        -------
-        Identity or None
-            None when GitHub rejects the token or cannot be reached. A
-            verifier that cannot check a token must not accept it.
-        """
-        now = time.monotonic()
-        cached = self._cache.get(token)
-
-        if cached and cached[0] > now:
-            return cached[1]
-
-        try:
-            response = self._client.get(
-                GITHUB_USER_URL,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Accept": "application/vnd.github+json",
-                },
-            )
-        except httpx.HTTPError:
-            return None  # unreachable GitHub is a failure to verify, not a pass
-
-        if response.status_code != httpx.codes.OK:
-            return None
-
-        user = response.json()
-        identity = Identity(
-            github_id=user["id"], github_login=user.get("login", "")
-        )
-        self._cache[token] = (now + self._ttl, identity)
-
-        return identity
+        return registry.identity_for_token(token)
 
 
 def bearer_token(header: str | None) -> str | None:

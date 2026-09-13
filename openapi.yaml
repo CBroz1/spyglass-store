@@ -10,7 +10,12 @@ info:
     decides whether that identity may read a file, and issues a short-lived
     presigned URL to the object store. Once issued, the broker is out of the
     data path and cannot revoke or meter the transfer, which is why URL
-    lifetimes are short and quota is charged at issue time.
+    lifetimes are short and volume is charged at issue time.
+
+    Volume limits are a guardrail against a runaway script or a careless bulk
+    pull, not an accounting system. A legitimate user is not expected to
+    approach them, and every imprecision in them errs toward letting a real
+    user through.
 
     This document is the contract. The Spyglass client validates against it in
     CI, and this repository contract-tests against the released client. The
@@ -95,10 +100,10 @@ paths:
                 $ref: "#/components/schemas/File"
         "401":
           $ref: "#/components/responses/Unauthorized"
-        "403":
-          description: Not readable by this identity
         "404":
-          description: No such file
+          description: |
+            No such file, or none this identity may read. See the note on the
+            content endpoint for why those are one answer.
         "422":
           description: Neither name nor sha256 was given
 
@@ -106,9 +111,15 @@ paths:
     post:
       summary: Register an upload
       description: |
-        Records the file and returns a presigned URL to write the object.
+        Records the file and returns a presigned URL to write the object,
+        plus the headers that must accompany the write.
+
         Registering a hash that already exists deduplicates: the existing
         object is reused and no upload URL is returned.
+
+        The declared `sha256` is signed into the upload URL, so the object
+        store verifies the bytes on arrival. Content cannot be registered
+        under one hash and uploaded as another.
       operationId: registerFile
       requestBody:
         required: true
@@ -164,7 +175,15 @@ paths:
         "403":
           description: Not readable by this identity
         "404":
-          description: No such file
+          description: |
+            No such file, or none this identity may read. The two are one
+            answer on purpose: distinguishing them would confirm a file exists
+            to a caller with no right to know, and would stop a client falling
+            through to another source that can serve it.
+        "409":
+          description: |
+            Registered, but the bytes have not arrived yet. A normal transient
+            state — uploads are expected to be slow — not an error to clean up.
         "429":
           $ref: "#/components/responses/Throttled"
 
@@ -187,11 +206,21 @@ paths:
               $ref: "#/components/schemas/Visibility"
       responses:
         "200":
-          description: Updated
+          description: The visibility now in force
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VisibilityResult"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
-          description: Not the owner
+          description: |
+            Not the owner. Readability is not enough — a team member may read
+            a file without being able to widen who else can.
+        "404":
+          description: No such file
+        "422":
+          description: Scope is group but no teams were named
 
 components:
   securitySchemes:
@@ -257,7 +286,8 @@ components:
 
     File:
       type: object
-      required: [file_id, sha256, size_bytes, spyglass_name, file_class]
+      required:
+        [file_id, sha256, size_bytes, spyglass_name, file_class, uploaded]
       properties:
         file_id:
           type: string
@@ -271,6 +301,12 @@ components:
         file_class:
           type: string
           enum: [raw, analysis]
+        uploaded:
+          type: boolean
+          description: |
+            False while a registration exists but its bytes have not arrived.
+            Lets a client see that someone else's upload is still in progress
+            rather than treating the file as broken.
 
     FileRegistration:
       type: object
@@ -302,6 +338,29 @@ components:
           type: string
           format: uri
           description: Absent when deduplicated.
+        upload_headers:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Headers to send verbatim with the PUT. They carry the checksum the
+            store verifies the uploaded bytes against, and they are covered by
+            the URL signature — omitting them fails the upload rather than
+            skipping verification. Empty when deduplicated.
+
+    VisibilityResult:
+      type: object
+      required: [file_id, scope, teams]
+      properties:
+        file_id:
+          type: string
+        scope:
+          type: string
+          enum: [private, group, public]
+        teams:
+          type: array
+          items:
+            type: string
 
     Visibility:
       type: object

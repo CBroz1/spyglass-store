@@ -19,12 +19,14 @@ markdown_extensions:
       toc_depth: 3
 nav:
   - "index.md"
+  - "github-app.md"
 repo_name: LorenFrankLab/spyglass-store
 repo_url: https://github.com/LorenFrankLab/spyglass-store
 site_name: spyglass-store docs
 site_url: ""
 theme:
   favicon: assets/images/favicon.png
+  logo: assets/images/favicon.png
   features:
     - content.code.annotate
     - content.code.copy
@@ -33,7 +35,6 @@ theme:
     - navigation.top
   font: false
   icon:
-    logo: octicons/book-24
     repo: octicons/mark-github-16
   name: material
   palette:
