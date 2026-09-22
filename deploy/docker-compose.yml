@@ -40,7 +40,11 @@ services:
     # MinIO stands in for the deployed object store. Ceph RGW, SeaweedFS, and
     # Garage are all reachable by changing this image and the endpoint below;
     # the broker speaks only the S3 API and knows about none of them.
-    image: minio/minio:latest
+    # quay.io, not Docker Hub: MinIO withdrew their images from Docker Hub, so
+    # `minio/minio` refuses anonymous pulls. Pinned to a release rather than
+    # `latest` so an upstream change cannot break a deployment you did not
+    # touch. Bump it deliberately.
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${SPYGLASS_STORE_S3_ACCESS_KEY:?set in .env}
@@ -62,7 +66,7 @@ services:
   # storage is an operator action, not something a web service should do with
   # the credential it holds.
   createbucket:
-    image: minio/mc:latest
+    image: quay.io/minio/mc:latest
     depends_on:
       store:
         condition: service_healthy

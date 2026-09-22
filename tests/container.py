@@ -30,12 +30,19 @@ import urllib.request
 from pathlib import Path
 
 MYSQL_NAME = "spyglass-store-pytest"
-MYSQL_IMAGE = "datajoint/mysql:8.0"
+MYSQL_IMAGE = "datajoint/mysql:8.0"  # a minor line, not a moving latest
 MYSQL_PASSWORD = "tutorial"
 MYSQL_USER = "root"
 
 S3_NAME = "spyglass-store-pytest-s3"
-S3_IMAGE = "minio/minio:latest"
+# quay.io, not Docker Hub: MinIO withdrew their images from Docker Hub, so
+# `minio/minio` now refuses anonymous pulls. A developer with an old copy
+# cached sees tests pass while CI cannot pull at all.
+#
+# Pinned to a release rather than `latest` for the same reason the move caught
+# us: a moving tag lets an upstream change break CI with no commit here. Bump
+# it deliberately.
+S3_IMAGE = "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
 S3_USER = "spyglasstest"
 S3_PASSWORD = "spyglasstestsecret"  # MinIO requires at least 8 characters
 S3_BUCKET = "spyglass-store-test"
@@ -210,7 +217,7 @@ class _Container:
             # Through a container, because the files belong to the service's
             # uid and are not ours to delete from the host.
             self.client.containers.run(
-                image="alpine",
+                image="alpine:3",  # pinned; `latest` is a moving target
                 command=["sh", "-c", "rm -rf /data/..?* /data/.[!.]* /data/*"],
                 volumes={str(self.vol_dir): {"bind": "/data", "mode": "rw"}},
                 remove=True,

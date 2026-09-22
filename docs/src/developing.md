@@ -34,6 +34,12 @@ Useful flags:
 
 Coverage must stay at or above 70%: `coverage run && coverage report`.
 
+Container images are pinned to specific releases, and MinIO comes from `quay.io`
+rather than Docker Hub — MinIO withdrew their Docker Hub images, so
+`minio/minio` now refuses anonymous pulls. A developer with an old copy cached
+locally will not notice; CI, pulling fresh, cannot start at all. Bump the pins
+in `tests/container.py` and `deploy/docker-compose.yml` together.
+
 ## Where things live
 
 ```
@@ -51,9 +57,6 @@ src/spyglass_store/
 ├── settings.py   # configuration
 └── cli/          # the admin CLI
 ```
-
-`broker/` and `broker/api/` are empty packages left from an earlier plan. The
-service is `app.py`.
 
 Two files repay reading before anything else. **`access.py`** holds the entire
 permission rule — if you are changing who can see what, the answer is in that
@@ -118,6 +121,51 @@ runs synchronous handlers on a worker threadpool. Every function in
 `registry.py` and `lab.py` is therefore wrapped in `db.serialized`. If you add a
 function that queries, wrap it too — the failure mode is interleaved cursors
 under concurrency, which the serial test client cannot reproduce.
+
+## Rejected alternatives
+
+Decisions that look like oversights until you know why. Each was considered and
+turned down for a reason that is not visible in the code that resulted.
+
+### Reusing DataJoint's file hash instead of SHA-256
+
+A natural question: DataJoint already hashes filepath-store files, and a client
+uploading from another instance has one in its `~external_filepath` table. Why
+compute a second digest?
+
+Three reasons, any one of which is disqualifying.
+
+**It is MD5.** `datajoint.hash.uuid_from_stream` is `hashlib.md5` packed into a
+UUID. Here the hash *is* the object key and the store enforces it on upload, so
+a forgeable digest is a forgeable address: an uploader could register one file
+and upload a colliding other, and every reader would receive bytes the broker
+had certified. MD5 collisions are constructible on a laptop. Content addressing
+an adversary can forge is not content addressing.
+
+**It is absent for the files that matter.** Spyglass sets
+`filepath_checksum_size_limit` to 1 GB, and DataJoint skips the content hash
+above it, storing `None`. Raw NWB sessions are routinely larger, so for exactly
+the files this service exists to move there is no hash to reuse — we would fall
+back to computing one for the expensive cases only.
+
+**The externals primary key is not a content hash.** It is
+`uuid_from_buffer(init_string=relative_filepath)` — DataJoint's own comment
+reads "hash relative path, not contents." It is scoped to one store's staging
+directory on one instance, so two labs holding identical bytes get different
+values and one lab reorganizing directories gets a new value for unchanged data.
+It cannot deduplicate or address content across instances, which is the whole
+job.
+
+The cost of computing our own is a second *local* pass, not a second upload:
+reading 10 GB from disk is seconds against minutes of transfer, and only on
+upload — readers never hash anything. If that ever becomes the bottleneck, the
+fix is a streaming checksum during upload, not a weaker digest.
+
+DataJoint's hash is still useful *as a client-side pre-filter*: if a file's
+`contents_hash` matches what a previous upload recorded, it has not changed and
+re-registration can be skipped without reading it. That is an optimization,
+never a trust decision — the store still verifies SHA-256 on the bytes it
+receives.
 
 ## Things that are deliberately imprecise
 
