@@ -22,6 +22,9 @@ all notable changes to this project.
 - Rate limit on the unauthenticated login endpoints, at an nginx edge that
     publishes the broker; they spend the deployment's shared GitHub client id,
     so an unthrottled caller could deny logins to everyone #1
+- Those limits are set from `SPYGLASS_STORE_EDGE_*` in `.env`, rendered into
+    `deploy/nginx.conf.template` at startup, so tuning them needs no nginx
+    knowledge #1
 
 ### Changed
 

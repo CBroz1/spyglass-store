@@ -119,13 +119,43 @@ services:
   # The rate limiter, and the only reason this deployment has a proxy at all.
   # `/auth/device` and `/auth/token` take no credential and spend the broker's
   # own GitHub client id, so they need a ceiling — and the hop that knows the
-  # caller's address is the one that can enforce one. See nginx.conf.
+  # caller's address is the one that can enforce one. See nginx.conf.template.
   edge:
     image: nginx:1.27-alpine
     depends_on:
       - broker
     volumes:
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      # A template, not a config: the image renders anything under
+      # /etc/nginx/templates through envsubst at startup, which is what makes
+      # the limits below settable from `.env`.
+      - ./nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
+    environment:
+      # Substitute only our own variables. Without this filter envsubst is
+      # handed every name in the environment, and nginx's configuration is full
+      # of `$variables` that must survive rendering untouched.
+      NGINX_ENVSUBST_FILTER: "^SPYGLASS_STORE_EDGE_"
+
+      # The rate limits, with the defaults the template documents. Edge
+      # settings, not broker settings — the application never reads these.
+      #
+      # Starting a login is rare and human.
+      SPYGLASS_STORE_EDGE_DEVICE_RATE: ${SPYGLASS_STORE_EDGE_DEVICE_RATE:-6r/m}
+      SPYGLASS_STORE_EDGE_DEVICE_BURST: ${SPYGLASS_STORE_EDGE_DEVICE_BURST:-5}
+
+      # Polling is neither. The device flow polls every `interval` seconds — 5
+      # by default — until the user approves, so an honest login sustains 12r/m
+      # for as long as they take. Tightening this breaks slow logins.
+      SPYGLASS_STORE_EDGE_POLL_RATE: ${SPYGLASS_STORE_EDGE_POLL_RATE:-15r/m}
+      SPYGLASS_STORE_EDGE_POLL_BURST: ${SPYGLASS_STORE_EDGE_POLL_BURST:-20}
+
+      # The ceiling across all callers, because one GitHub client id is shared
+      # by everyone and per-address limits do nothing against a spread-out
+      # flood. Raising this raises how much of that budget one flood can spend.
+      SPYGLASS_STORE_EDGE_TOTAL_RATE: ${SPYGLASS_STORE_EDGE_TOTAL_RATE:-240r/m}
+      SPYGLASS_STORE_EDGE_TOTAL_BURST: ${SPYGLASS_STORE_EDGE_TOTAL_BURST:-40}
+
+      # Seconds, sent as `Retry-After` on a throttled response.
+      SPYGLASS_STORE_EDGE_RETRY_AFTER: ${SPYGLASS_STORE_EDGE_RETRY_AFTER:-60}
     ports:
       # The broker's public port, now served by the edge. A distinct origin
       # from the object store above; see the note at the top of this file.

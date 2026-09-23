@@ -36,8 +36,9 @@ this module's. They proxy to GitHub on the broker's own client id, so an
 unthrottled caller can exhaust the app's GitHub rate limit and deny logins to
 everyone. Doing it here would mean trusting `X-Forwarded-For` to tell one
 caller from another, which behind a proxy requires a trusted-hop count the
-broker does not have — `client_ip` is deliberately audit-only. See
-`deploy/nginx.conf`.
+broker does not have — `client_ip` is deliberately audit-only. The limits live
+in `deploy/nginx.conf.template`, tunable from the deployment's `.env`, and
+there is nothing in `settings.py` to match them on purpose.
 """
 
 from __future__ import annotations

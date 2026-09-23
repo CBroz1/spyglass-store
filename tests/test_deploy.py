@@ -11,6 +11,7 @@ guards on intent, not a substitute for running the stack: `nginx -t` validates
 the syntax, and only a real request shows a 429.
 """
 
+import re
 from pathlib import Path
 
 import pytest
@@ -19,7 +20,7 @@ yaml = pytest.importorskip("yaml")
 
 DEPLOY = Path(__file__).resolve().parents[1] / "deploy"
 COMPOSE_PATH = DEPLOY / "docker-compose.yml"
-NGINX_PATH = DEPLOY / "nginx.conf"
+NGINX_PATH = DEPLOY / "nginx.conf.template"
 
 #: Every route that takes no credential. Each one spends the broker's own
 #: GitHub client id, so each one needs a ceiling.
@@ -34,8 +35,14 @@ def compose() -> dict:
 
 @pytest.fixture(scope="module")
 def nginx() -> str:
-    """The edge configuration, as text."""
+    """The edge configuration template, as text."""
     return NGINX_PATH.read_text()
+
+
+@pytest.fixture(scope="module")
+def edge_env(compose: dict) -> dict:
+    """The environment the compose file renders the template with."""
+    return compose["services"]["edge"]["environment"]
 
 
 def test_the_broker_is_only_reachable_through_the_edge(compose: dict) -> None:
@@ -56,10 +63,57 @@ def test_the_broker_is_only_reachable_through_the_edge(compose: dict) -> None:
 
 
 def test_the_edge_serves_the_config_in_this_directory(compose: dict) -> None:
-    """A config that is not mounted limits nothing."""
+    """A config that is not mounted limits nothing.
+
+    It has to land under `/etc/nginx/templates` specifically. Mounted straight
+    into `conf.d` the file is served verbatim, `${...}` and all, and nginx
+    refuses to start.
+    """
     mounts = compose["services"]["edge"]["volumes"]
 
-    assert any(mount.startswith("./nginx.conf:") for mount in mounts)
+    assert any(
+        mount.startswith(f"./{NGINX_PATH.name}:")
+        and "/etc/nginx/templates/" in mount
+        for mount in mounts
+    )
+
+
+def test_every_limit_in_the_template_has_a_default(
+    nginx: str, edge_env: dict
+) -> None:
+    """A placeholder nothing sets renders empty, and nginx will not start.
+
+    The point of the template is that a maintainer tunes limits in `.env`
+    rather than in nginx syntax. That only holds if the deployment works with
+    an empty `.env`, so every variable needs a default here — and a typo in
+    either file is exactly the drift this catches.
+    """
+    used = set(re.findall(r"\$\{(SPYGLASS_STORE_EDGE_[A-Z_]+)\}", nginx))
+    provided = {
+        key for key in edge_env if key.startswith("SPYGLASS_STORE_EDGE_")
+    }
+
+    assert used, "the template no longer parameterizes anything"
+    assert used == provided, (
+        "template and compose disagree; unset renders empty and nginx refuses "
+        f"to start. Only in the template: {sorted(used - provided)}. Only in "
+        f"compose: {sorted(provided - used)}"
+    )
+    missing = [key for key in provided if ":-" not in str(edge_env[key])]
+    assert not missing, f"no default, so an empty .env breaks: {missing}"
+
+
+def test_rendering_leaves_nginx_own_variables_alone(
+    nginx: str, edge_env: dict
+) -> None:
+    """envsubst substitutes every name it is given, and nginx is full of them.
+
+    Unfiltered, `$host` or `$remote_addr` would be replaced by whatever happens
+    to be in the container's environment — most likely nothing, which silently
+    guts `proxy_set_header` and the limiter's key.
+    """
+    assert edge_env.get("NGINX_ENVSUBST_FILTER") == "^SPYGLASS_STORE_EDGE_"
+    assert "$binary_remote_addr" in nginx, "the limiter still keys on the peer"
 
 
 def test_every_unauthenticated_route_is_rate_limited(nginx: str) -> None:

@@ -104,16 +104,35 @@ and they proxy to GitHub on the broker's own client id. Left open, one caller
 exhausts the app's GitHub rate limit and nobody can log in — no account needed,
 and the broker's own quota never sees it because there is no account to charge.
 
-`deploy/nginx.conf` limits them, and `docker-compose.yml` publishes that edge
-instead of the broker. **Publishing the broker's port alongside it defeats the
-whole arrangement**, so if you replace this proxy with your own, keep the
-broker unpublished.
+`deploy/nginx.conf.template` limits them, and `docker-compose.yml` publishes
+that edge instead of the broker. **Publishing the broker's port alongside it
+defeats the whole arrangement**, so if you replace this proxy with your own,
+keep the broker unpublished.
 
-| Route | Per caller | Burst |
+### Tuning the limits
+
+Set them in `.env` with everything else. The nginx image renders the template
+through `envsubst` at startup, so no one has to edit nginx syntax to change a
+number, and `docker compose up` works with none of these set.
+
+| Variable | Default | Limits |
 | --- | --- | --- |
-| `POST /auth/device` | 6/min | 5 |
-| `POST /auth/token` | 15/min | 20 |
-| both, across all callers | 240/min | 40 |
+| `SPYGLASS_STORE_EDGE_DEVICE_RATE` | `6r/m` | `POST /auth/device`, per caller |
+| `SPYGLASS_STORE_EDGE_DEVICE_BURST` | `5` | how many may arrive at once |
+| `SPYGLASS_STORE_EDGE_POLL_RATE` | `15r/m` | `POST /auth/token`, per caller |
+| `SPYGLASS_STORE_EDGE_POLL_BURST` | `20` | how many may arrive at once |
+| `SPYGLASS_STORE_EDGE_TOTAL_RATE` | `240r/m` | both routes, all callers together |
+| `SPYGLASS_STORE_EDGE_TOTAL_BURST` | `40` | how many may arrive at once |
+| `SPYGLASS_STORE_EDGE_RETRY_AFTER` | `60` | seconds sent on a 429 |
+
+`r/m` is nginx's own spelling; `r/s` works too. A rate is the sustained
+allowance and a burst is how far a client may run ahead of it — **raise a rate
+without its burst and a client that sends a handful of requests together still
+gets a 429.** That is the mistake to expect.
+
+These are edge settings, not broker settings. Nothing in `settings.py` reads
+them, which is deliberate: the application must not look as though it enforces
+something it cannot see.
 
 The token endpoint is looser because GitHub's device flow polls it: a client
 asks every `interval` seconds — 5 by default — until the user approves, so an
@@ -138,8 +157,8 @@ content redirect once per range request, which looks exactly like a flood.
 
 A CDN, a load balancer, or a cluster ingress makes every request arrive from
 one address, so all callers share a single bucket. Uncomment `set_real_ip_from`
-in `nginx.conf` and name that hop **exactly**; a wide range there lets a caller
-choose their own bucket by forging `X-Forwarded-For`.
+in `nginx.conf.template` and name that hop **exactly**; a wide range there lets
+a caller choose their own bucket by forging `X-Forwarded-For`.
 
 That is also why the broker does not do this itself. Behind a proxy it sees
 only the proxy, so it would have to trust a caller-supplied header without
