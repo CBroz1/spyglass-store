@@ -13,16 +13,9 @@ pytest --container-vol-dir=/path/on/a/roomy/disk
 ```
 
 The suite starts its own containers — MySQL for the registry, MinIO for the
-object store — so **Docker must be running**. Tests that need them skip cleanly
-if it is not, which means a green run on a machine without Docker has silently
-skipped everything that touches a database.
-
-`--container-vol-dir` matters more than it looks. MySQL wants a two gigabyte
-InnoDB log before it will start, and Docker's default volume root is usually on
-`/`, which on a workstation is the disk with no room to spare. Point it at a
-disk with space and container data goes there instead; volumes are cleared
-whenever a container is removed. You can also set
-`SPYGLASS_STORE_DOCKER_VOL_DIR` and forget about it.
+object store — so **Docker must be running**. MySQL wants a two gigabyte InnoDB
+log before it will start, so use `--container-vol-dir` to point to a disk with
+ample space, or set `SPYGLASS_STORE_DOCKER_VOL_DIR` and forget about it.
 
 Useful flags:
 
@@ -30,22 +23,29 @@ Useful flags:
 | ------------------------- | ------------------------------------------------------- |
 | `--container-vol-dir=DIR` | keep container data off the root disk                   |
 | `--keep-container`        | leave containers up between runs; skips ~30s of startup |
-| `-k name`                 | the usual pytest selection                              |
 
 Coverage must stay at or above 70%: `coverage run && coverage report`.
 
-Container images are pinned to specific releases, and MinIO comes from `quay.io`
-rather than Docker Hub — MinIO withdrew their Docker Hub images, so
-`minio/minio` now refuses anonymous pulls. A developer with an old copy cached
-locally will not notice; CI, pulling fresh, cannot start at all. Bump the pins
-in `tests/container.py` and `deploy/docker-compose.yml` together.
+An exited test container is **recreated, not restarted**. Restarting re-runs
+MySQL's entrypoint against a half-initialized data directory, which wedges it
+permanently — and because the failure happens before the fixture yields,
+teardown never runs and every later run inherits the broken container. Do not
+undo that.
+
+`.env` is deliberately not read under pytest, so a stray file in the working
+directory cannot make the suite machine-dependent. Tests that want configuration
+construct `Settings(...)` explicitly.
+
+Container images are pinned to specific releases, and MinIO comes from
+`quay.io`. Bump the pins in `tests/container.py` and `deploy/docker-compose.yml`
+together.
 
 ## Where things live
 
 ```
 src/spyglass_store/
 ├── app.py        # the FastAPI service: all six routes
-├── access.py     # the whole permission rule. Start here.
+├── access.py     # the whole permission rule. **Start here.**
 ├── auth.py       # bearer token -> Identity
 ├── github.py     # device flow; all GitHub wire format is contained here
 ├── registry.py   # every database read and write
@@ -58,10 +58,8 @@ src/spyglass_store/
 └── cli/          # the admin CLI
 ```
 
-Two files repay reading before anything else. **`access.py`** holds the entire
-permission rule — if you are changing who can see what, the answer is in that
-one file by design. **`openapi.yaml`** is the contract, and a test asserts the
-running app matches it, so changing a route means changing both.
+**`openapi.yaml`** is the contract, and a test asserts the running app matches
+it, so changing a route means changing both.
 
 ## Invariants
 
@@ -72,22 +70,27 @@ a reason that is not obvious from the code that depends on it.
 
 Reflect its tables with `dj.create_virtual_module` instead — `lab.py` shows how.
 Importing `spyglass.common` pulls pynwb, spikeinterface, jax, and the `numpy<2`
-/ `scipy<1.13` pins into a web service that needs none of them. Keeping that
-stack out is *the reason this is a separate repository*, and an import would
-work fine on your laptop while quietly undoing it.
+/ `scipy<1.13` pins into a web service that needs none of them.
 
-### The broker never touches file bytes
+### The broker is never in the data path
 
-It decides, signs a URL, and steps out. Anything that would make the service
-read or proxy object data — however convenient — changes what this is. A
-multi-terabyte read must not flow through the broker, and a test asserts the
-content endpoint never returns 200.
+It decides, signs a URL, and steps out. File contents move between the client
+and the object store, never through this service — a multi-terabyte read must
+not flow through the broker, and a test asserts the content endpoint never
+returns 200.
 
 The consequences follow from that constraint rather than from preference:
 presigned URLs are short-lived because they cannot be revoked; volume is charged
 when a URL is issued because that is the last moment the broker is involved; and
-the uploaded hash is verified by the *store*, via a checksum signed into the
-upload URL, because the broker never sees the bytes.
+an upload's hash is verified by the *store*, via a checksum signed into the
+upload URL, because the broker does not see what was uploaded.
+
+**One bounded exception**, and it is worth stating precisely rather than letting
+the rule read as absolute: proving possession reads `storage.PROOF_LENGTH` bytes
+of an existing object. See "Claiming stored content requires holding it" below
+for why. The distinction that matters is transfer volume, not whether a byte is
+ever read — a 64-byte security check does not put the service in the data path,
+and nothing else may.
 
 ### The broker and the object store must be on different origins
 
@@ -112,9 +115,26 @@ someone who can already read it (they could download and re-upload anyway), nor
 when the object is absent (the upload itself proves possession, since the store
 verifies the hash).
 
-This is the one place the broker reads object data, bounded to
-`storage.PROOF_LENGTH` bytes. That is a deliberate, stated exception to staying
-out of the data path — it is a security check, not a transfer.
+This is the **only** place the broker reads object data, and the one exception
+to the data-path rule above. It is bounded to `storage.PROOF_LENGTH` bytes and
+runs once per registration, not per read. If you find yourself widening it —
+reading more, or reading on a hot path — that is the rule being eroded rather
+than applied, and the alternative designs (re-uploading the whole file, or
+dropping cross-owner deduplication) are the ones to weigh instead.
+
+### A Spyglass name identifies content, not a registration
+
+`spyglass_name` is the primary key of a Spyglass file table, so within one
+instance it names exactly one file. Several registrations of that name are
+therefore not rival answers about *which* file — they are several people's
+declarations about the same one, differing in owner and visibility.
+
+So `resolve` returns the declaration the caller is party to, and 404s when they
+are party to none. That is deliberately indistinguishable from "no such file":
+saying "forbidden" would confirm a file exists to someone with no right to know,
+and would stop a client falling through to another backend that can serve it.
+The same applies to a hash, which is also non-unique — deduplication is the
+designed-for case.
 
 ### Spyglass's lab tables are trust roots
 

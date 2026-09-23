@@ -150,3 +150,29 @@ def test_contract_matches_the_application(spec: dict) -> None:
     assert not missing, "contract and application disagree:\n  " + "\n  ".join(
         missing
     )
+
+
+def test_the_object_store_image_matches_the_deployment() -> None:
+    """The suite must test against the image the deployment runs.
+
+    The pin appears twice — in `tests/container.py` and in the compose file —
+    because neither should import the other: the test harness has no business
+    reading a deployment artifact at runtime, and compose cannot read Python.
+    Duplication is the right shape; drift is the risk, so assert it here
+    instead of relying on someone remembering.
+
+    It has already caught us once. MinIO withdrew their images from Docker
+    Hub, and a stale local cache hid it completely while CI could not pull at
+    all. When you bump one, this fails until you bump the other.
+    """
+    import re
+
+    from tests.container import S3_IMAGE
+
+    compose = (SPEC_PATH.parent / "deploy" / "docker-compose.yml").read_text()
+    images = set(re.findall(r"^\s*image:\s*(\S+)", compose, re.M))
+
+    assert S3_IMAGE in images, (
+        f"tests use {S3_IMAGE}, which the compose file does not run. "
+        f"It runs: {sorted(images)}"
+    )

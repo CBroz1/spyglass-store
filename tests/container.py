@@ -5,9 +5,10 @@ Spyglass does — no per-pipeline grants, no populated data directory, no
 alternate MySQL versions — so what remains is: start a container, wait for it
 to be ready, hand back credentials, and remove it afterwards.
 
-Containers are named and ported deterministically, so a repeat run reuses the
-one already up instead of racing a second server onto the same port. CI gets a
-fresh runner each time and so always starts new.
+Containers are named `broker-*`, so everything this project starts is
+identifiable at a glance and removable with one filter. A repeat run reuses
+the container already up rather than starting a second; CI gets a fresh runner
+each time and so always starts new.
 
 Pass `--container-vol-dir` to keep container data off the root disk. MySQL
 wants a two gigabyte InnoDB log before it will start, and Docker's default
@@ -29,12 +30,12 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-MYSQL_NAME = "spyglass-store-pytest"
+MYSQL_NAME = "broker-pytest-db"
 MYSQL_IMAGE = "datajoint/mysql:8.0"  # a minor line, not a moving latest
 MYSQL_PASSWORD = "tutorial"
 MYSQL_USER = "root"
 
-S3_NAME = "spyglass-store-pytest-s3"
+S3_NAME = "broker-pytest-s3"
 # quay.io, not Docker Hub: MinIO withdrew their images from Docker Hub, so
 # `minio/minio` now refuses anonymous pulls. A developer with an old copy
 # cached sees tests pass while CI cannot pull at all.
