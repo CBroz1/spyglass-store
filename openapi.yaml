@@ -40,6 +40,10 @@ paths:
       description: |
         Returns a code the user types at GitHub. No callback server is needed,
         so this works over SSH and inside Docker.
+
+        Unauthenticated, and therefore rate limited at the edge rather than
+        metered per account. Starting a login is a human action; a client that
+        automates it will meet a 429.
       security: []
       operationId: beginDeviceFlow
       responses:
@@ -49,10 +53,17 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DeviceCode"
+        "429":
+          $ref: "#/components/responses/Throttled"
 
   /auth/token:
     post:
       summary: Exchange a device code for a broker token
+      description: |
+        Polled at the `interval` the device response gave, until the user
+        approves. Unauthenticated, so it is rate limited at the edge with
+        enough headroom for that polling — a client that honours `interval`
+        and the `Retry-After` on a 428 will not meet a 429.
       security: []
       operationId: exchangeDeviceCode
       requestBody:
@@ -76,6 +87,8 @@ paths:
           description: Authorization still pending; keep polling
         "403":
           description: Account rejected, for example below the minimum age
+        "429":
+          $ref: "#/components/responses/Throttled"
 
   /file/resolve:
     get:

@@ -19,3 +19,20 @@ all notable changes to this project.
     profiles for Cloudflare R2, SeaweedFS, Ceph RGW, Garage, and AWS #1
 - Startup checks for the object store and the Spyglass lab schema, so
     misconfiguration fails the boot rather than a user request #1
+- Rate limit on the unauthenticated login endpoints, at an nginx edge that
+    publishes the broker; they spend the deployment's shared GitHub client id,
+    so an unthrottled caller could deny logins to everyone #1
+
+### Changed
+
+- Quota totals are aggregated by MySQL rather than folded in Python, so the
+    check no longer scales with how many requests an account has made #1
+- `app.py` split into the routing (`app.py`), the checks each route runs
+    (`guards.py`), the wire shapes (`models.py`), and the boot verification
+    (`deployment.py`) #1
+
+### Fixed
+
+- Upload volume was metered against download events: `usage_since` ignored the
+    action it was asked for and always totalled reads, so a day of downloading
+    exhausted the upload allowance #1

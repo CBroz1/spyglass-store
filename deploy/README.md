@@ -58,9 +58,13 @@ cp .env.example .env     # at the repository root, then fill it in
 docker compose -f deploy/docker-compose.yml up --build
 ```
 
-Three services: the object store, a one-shot job that creates the bucket, and
-the broker. The broker waits for the bucket to exist, because it verifies
-storage at startup and will otherwise refuse to boot.
+Four services: the object store, a one-shot job that creates the bucket, the
+broker, and an nginx edge that publishes it. The broker waits for the bucket to
+exist, because it verifies storage at startup and will otherwise refuse to
+boot.
+
+The broker itself is not published to the host. The edge is the front door, and
+it is where the login endpoints are rate limited — see below.
 
 The broker does not create the bucket itself. Provisioning storage is an
 operator action; a web service holding the only write credential should not
@@ -92,6 +96,56 @@ from the symptom.
 The second is the natural thing to reach for on a single host, which is why it
 is worth stating. Set `SPYGLASS_STORE_PUBLIC_BASE_URL` to the broker's public
 URL and it will warn at startup if it detects the collision.
+
+## Rate limiting the login endpoints
+
+`/auth/device` and `/auth/token` are the only routes that take no credential,
+and they proxy to GitHub on the broker's own client id. Left open, one caller
+exhausts the app's GitHub rate limit and nobody can log in — no account needed,
+and the broker's own quota never sees it because there is no account to charge.
+
+`deploy/nginx.conf` limits them, and `docker-compose.yml` publishes that edge
+instead of the broker. **Publishing the broker's port alongside it defeats the
+whole arrangement**, so if you replace this proxy with your own, keep the
+broker unpublished.
+
+| Route | Per caller | Burst |
+| --- | --- | --- |
+| `POST /auth/device` | 6/min | 5 |
+| `POST /auth/token` | 15/min | 20 |
+| both, across all callers | 240/min | 40 |
+
+The token endpoint is looser because GitHub's device flow polls it: a client
+asks every `interval` seconds — 5 by default — until the user approves, so an
+honest login sustains 12/min for as long as someone takes to find the browser
+tab. Tightening that limit breaks slow logins rather than stopping abuse.
+
+The service-wide ceiling exists because per-address limits do nothing against a
+spread-out flood, and the thing being protected is shared: one GitHub rate
+limit for the deployment. Raise it for a larger site, knowing that what you are
+raising is how much of that budget one flood can spend.
+
+Throttling answers 429 with `Retry-After`, matching what `openapi.yaml`
+documents for quota, so a client that already backs off correctly needs no
+change.
+
+Authenticated routes are deliberately not rate limited here. They are metered
+per account by the broker's volume quota, and a request-rate limit on top would
+throttle the workload this service exists for — a streamed read re-follows the
+content redirect once per range request, which looks exactly like a flood.
+
+### If something else sits in front
+
+A CDN, a load balancer, or a cluster ingress makes every request arrive from
+one address, so all callers share a single bucket. Uncomment `set_real_ip_from`
+in `nginx.conf` and name that hop **exactly**; a wide range there lets a caller
+choose their own bucket by forging `X-Forwarded-For`.
+
+That is also why the broker does not do this itself. Behind a proxy it sees
+only the proxy, so it would have to trust a caller-supplied header without
+knowing how many hops to trust. `X-Forwarded-For` is recorded for audit and
+decides nothing (`guards.client_ip`); if that is ever to change, trusted-proxy
+handling has to come first.
 
 ## Database prerequisite: two tables must be admin-only
 

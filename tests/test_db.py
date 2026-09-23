@@ -1018,3 +1018,105 @@ def test_an_ambiguous_github_login_is_flagged(db, lab_tables, caplog):
     assert member is not None
     assert "recorded against 2 lab members" in caplog.text
     assert "unique index" in caplog.text
+
+
+# ------------------------- what the meter counts -------------------------
+
+
+def test_upload_volume_is_metered_apart_from_download_volume(db, uploader):
+    """Two allowances are configured apart, so they have to count apart.
+
+    Totalling reads whichever action was asked for made the upload limit a
+    second, stricter download limit: a day of reading exhausted it without
+    anyone uploading a byte, and an admin reading `account show` was told
+    downloads had been uploaded.
+    """
+    from spyglass_store import registry
+
+    ident = Identity(github_id=9001, account_id=uploader, tier="verified")
+    registry.log_access(
+        identity=ident,
+        action="read",
+        granted=True,
+        file_id="a" * 32,
+        size_bytes=500,
+    )
+    registry.log_access(
+        identity=ident,
+        action="register",
+        granted=True,
+        file_id="b" * 32,
+        size_bytes=10,
+    )
+
+    assert registry.usage_since(uploader, 24, "read").total_bytes == 500
+    assert registry.usage_since(uploader, 24, "register").total_bytes == 10
+
+
+def test_the_meter_folds_repeat_reads_in_one_query(db, uploader):
+    """The log grows per request; the answer must not.
+
+    Quota's unit is the distinct file, so a file read many times is one charge.
+    Summing that in Python meant fetching every read event in the window —
+    cheap until an account had been streaming, which is exactly when the check
+    runs most. The totals now come back from MySQL, one row per file.
+    """
+    from spyglass_store import registry
+
+    ident = Identity(github_id=9001, account_id=uploader, tier="verified")
+    for _ in range(4):
+        registry.log_access(
+            identity=ident,
+            action="read",
+            granted=True,
+            file_id="a" * 32,
+            size_bytes=40,
+        )
+    registry.log_access(
+        identity=ident,
+        action="read",
+        granted=True,
+        file_id="b" * 32,
+        size_bytes=25,
+    )
+
+    usage = registry.usage_since(uploader, 24)
+
+    assert usage.total_bytes == 65, "four reads of one file is one charge"
+    assert usage.files == {"a" * 32, "b" * 32}
+
+
+def test_the_meter_reports_the_oldest_charge_inside_the_window(db, uploader):
+    """`Retry-After` is derived from it, and the window ends at it.
+
+    A charge that has aged out must not be counted, and the oldest one that
+    has not is when capacity next returns. Folding the rows down to a total
+    must keep that minimum rather than any convenient row's timestamp.
+    """
+    from spyglass_store import registry
+    from spyglass_store.db import db_now
+
+    now = db_now()
+    rows = [
+        # (age, size) — the first has aged out of a 24h window.
+        (timedelta(hours=30), 999),
+        (timedelta(hours=6), 7),
+        (timedelta(hours=1), 3),
+    ]
+    for index, (age, size) in enumerate(rows):
+        db.AccessLog.insert1(
+            {
+                "account_id": int(uploader),
+                "action": "read",
+                "file_id": str(index) * 32,
+                "granted": 1,
+                "size_bytes": size,
+                "source_ip": "",
+                "timestamp": now - age,
+            }
+        )
+
+    usage = registry.usage_since(uploader, 24)
+
+    assert usage.total_bytes == 10, "the 30h-old charge has aged out"
+    assert usage.earliest == now - timedelta(hours=6)

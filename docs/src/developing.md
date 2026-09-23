@@ -44,8 +44,11 @@ together.
 
 ```
 src/spyglass_store/
-├── app.py        # the FastAPI service: all six routes
+├── app.py        # the FastAPI service: all six routes, and only the routing
 ├── access.py     # the whole permission rule. **Start here.**
+├── guards.py     # the checks a route runs, and the audit rows they write
+├── models.py     # the wire shapes, mirroring openapi.yaml
+├── deployment.py # what is verified at boot, and the origin comparison
 ├── auth.py       # bearer token -> Identity
 ├── github.py     # device flow; all GitHub wire format is contained here
 ├── registry.py   # every database read and write
@@ -57,6 +60,13 @@ src/spyglass_store/
 ├── settings.py   # configuration
 └── cli/          # the admin CLI
 ```
+
+The split between the top three is worth knowing before you add code to any of
+them. `access.py` decides *who may read what*, as a pure function over data and
+with no idea that HTTP exists. `guards.py` feeds it, meters it, logs what it
+decided, and turns a refusal into a status code. `app.py` reads the request,
+calls the guard that owns the decision, and answers. A new rule belongs in the
+first; a new thing to check before answering, in the second.
 
 **`openapi.yaml`** is the contract, and a test asserts the running app matches
 it, so changing a route means changing both.
@@ -101,6 +111,24 @@ missing `x-amz-content-sha256`, which reads nothing like an auth error.
 
 This is a deployment property, so the code can only warn. It does, at startup,
 when `SPYGLASS_STORE_PUBLIC_BASE_URL` is set.
+
+### The login endpoints are limited at the edge, not here
+
+`/auth/device` and `/auth/token` take no credential and spend the broker's own
+GitHub client id, so an unthrottled caller denies logins to everyone — and the
+volume quota cannot see it, because there is no account to charge.
+
+The limit lives in `deploy/nginx.conf`, and the compose file publishes that edge
+instead of the broker. Doing it in the application would mean telling callers
+apart by address, which behind a proxy means trusting `X-Forwarded-For` without
+knowing how many hops to trust; `guards.client_ip` records that header for audit
+and decides nothing on it. **If a rate limit ever does move into the app,
+trusted-proxy handling has to come first** — otherwise a forged header buys a
+fresh bucket per request, and the limit protects nothing while appearing to.
+
+The token endpoint's allowance is deliberately loose: the device flow polls it
+every few seconds until the user approves, so a tight limit breaks slow logins
+rather than stopping abuse. `deploy/README.md` has the numbers.
 
 ### Claiming stored content requires holding it
 

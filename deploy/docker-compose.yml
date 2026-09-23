@@ -108,7 +108,27 @@ services:
 
       SPYGLASS_STORE_SCHEMA_PREFIX: ${SPYGLASS_STORE_SCHEMA_PREFIX:-store}
       SPYGLASS_STORE_PRESIGNED_TTL_SECONDS: ${SPYGLASS_STORE_PRESIGNED_TTL_SECONDS:-300}
+    # Deliberately not published to the host. The edge below is the front door,
+    # and it is where the unauthenticated login endpoints are rate limited — a
+    # published broker port is a way around that limit. To reach the broker
+    # directly while debugging, `docker compose exec` into the network rather
+    # than opening a port here.
+    expose:
+      - "8000"
+
+  # The rate limiter, and the only reason this deployment has a proxy at all.
+  # `/auth/device` and `/auth/token` take no credential and spend the broker's
+  # own GitHub client id, so they need a ceiling — and the hop that knows the
+  # caller's address is the one that can enforce one. See nginx.conf.
+  edge:
+    image: nginx:1.27-alpine
+    depends_on:
+      - broker
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
     ports:
+      # The broker's public port, now served by the edge. A distinct origin
+      # from the object store above; see the note at the top of this file.
       - "8000:8000"
 
 volumes:

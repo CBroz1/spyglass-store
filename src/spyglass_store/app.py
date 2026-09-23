@@ -4,6 +4,11 @@ Implements the four `/file` operations of the contract in `openapi.yaml`:
 resolve, register, content redirect, and visibility, plus the two `/auth`
 endpoints that run GitHub's device flow.
 
+What is left here is the routing: read the request, call the check that owns
+the decision, answer. The parts that are not routing live next door —
+`models.py` holds the wire shapes, `guards.py` the checks each route runs and
+the audit rows they write, `deployment.py` what is verified at boot.
+
 Login is the only place a GitHub token exists. It is exchanged for one, used
 once to learn who the user is, and dropped; what the client keeps is a broker
 token that can read nothing on GitHub. Every other route verifies that token
@@ -25,492 +30,60 @@ of presigned-URL mode and rejects the request with a complaint about
 `x-amz-content-sha256` rather than anything mentioning signatures. Serving the
 broker and the object store under one hostname therefore breaks reads, which
 is a natural thing for a reverse proxy to do by accident.
+
+**Rate limiting the unauthenticated `/auth` endpoints is the edge's job**, not
+this module's. They proxy to GitHub on the broker's own client id, so an
+unthrottled caller can exhaust the app's GitHub rate limit and deny logins to
+everyone. Doing it here would mean trusting `X-Forwarded-For` to tell one
+caller from another, which behind a proxy requires a trusted-hop count the
+broker does not have — `client_ip` is deliberately audit-only. See
+`deploy/nginx.conf`.
 """
 
 from __future__ import annotations
 
-import logging
-import secrets
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
-from typing import Annotated, Literal
-from urllib.parse import urlsplit
+from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel, Field
 
 from spyglass_store import registry
-from spyglass_store.access import (
-    Scope,
-    may_read,
-    may_upload,
-    rules_for,
-)
+from spyglass_store.access import Scope, may_upload, rules_for
 from spyglass_store.auth import Identity, TokenVerifier, require_identity
+from spyglass_store.deployment import (
+    same_origin,  # noqa: F401 - re-exported; it moved, its importers did not
+    verify_deployment,
+)
 from spyglass_store.github import (
     AuthorizationPending,
     DeviceFlowError,
     GitHub,
 )
-from spyglass_store.lab import lab_member_for_github, verify_lab_schema
+from spyglass_store.guards import (
+    _authorize,
+    _charged_size,  # noqa: F401 - re-exported; it moved, importers did not
+    _enforce_quota,
+    _pick_readable,
+    _require_possession,
+    client_ip,
+)
+from spyglass_store.lab import lab_member_for_github
+from spyglass_store.models import (
+    DeviceCodeOut,
+    FileOut,
+    FileRegistrationIn,
+    TokenOut,
+    TokenRequest,
+    UploadTarget,
+    VisibilityIn,
+    VisibilityOut,
+)
 from spyglass_store.s3 import S3ObjectStore
 from spyglass_store.settings import Settings, get_settings
-from spyglass_store.storage import (
-    object_key,
-    proof_answer,
-    proof_challenge,
-)
+from spyglass_store.storage import object_key
 
 API_PREFIX = "/api/v1"
-
-
-class FileOut(BaseModel):
-    """A file, as the contract's `File` schema describes it."""
-
-    file_id: str
-    sha256: str = Field(pattern="^[0-9a-f]{64}$")
-    size_bytes: int
-    spyglass_name: str
-    file_class: str
-    uploaded: bool = True
-
-
-class VisibilityIn(BaseModel):
-    """Declared visibility, matching the contract's `Visibility` schema."""
-
-    scope: Literal["private", "group", "public"]
-    teams: list[str] = Field(default_factory=list)
-
-
-class FileRegistrationIn(BaseModel):
-    """A request to register an upload."""
-
-    sha256: str = Field(pattern="^[0-9a-f]{64}$")
-    size_bytes: int = Field(ge=0)
-    spyglass_name: str
-    file_class: Literal["raw", "analysis"]
-    visibility: VisibilityIn = Field(
-        default_factory=lambda: VisibilityIn(scope="private")
-    )
-    possession_proof: str | None = Field(
-        default=None,
-        description=(
-            "Digest answering the challenge from a prior 428. Required only "
-            "when claiming content already stored that this identity cannot "
-            "already read."
-        ),
-    )
-
-
-class DeviceCodeOut(BaseModel):
-    """What the user needs in order to approve a login."""
-
-    device_code: str
-    user_code: str
-    verification_uri: str
-    interval: int
-    expires_in: int
-
-
-class TokenRequest(BaseModel):
-    """A poll for the result of an approved device code."""
-
-    device_code: str
-
-
-class TokenOut(BaseModel):
-    """A broker token, and what it can do."""
-
-    access_token: str
-    tier: str
-    github_login: str = ""
-
-
-class VisibilityOut(BaseModel):
-    """The visibility now in force, echoed back so a client can confirm it."""
-
-    file_id: str
-    scope: str
-    teams: list[str]
-
-
-class PossessionRequired(BaseModel):
-    """What a caller must answer to claim content already in the store."""
-
-    detail: str
-    sha256: str
-    offset: int
-    length: int
-
-
-class UploadTarget(BaseModel):
-    """Where to put the bytes, if they are not already there.
-
-    `upload_headers` must be sent verbatim with the PUT. They carry the
-    checksum the store verifies the bytes against, and they are covered by the
-    signature, so dropping them fails the upload rather than skipping the
-    check.
-    """
-
-    file_id: str
-    deduplicated: bool
-    upload_url: str | None = None
-    upload_headers: dict[str, str] = Field(default_factory=dict)
-
-
-def same_origin(first: str, second: str) -> bool:
-    """Return True if two URLs share a scheme, host, and port.
-
-    Origin is what decides whether a client forwards `Authorization` across a
-    redirect, so it is the comparison that matters — not whether the two look
-    alike as strings.
-
-    Examples
-    --------
-    >>> same_origin("https://a.org/api", "https://a.org/objects")
-    True
-    >>> same_origin("https://a.org", "https://objects.a.org")
-    False
-    """
-    if not first or not second:
-        return False
-
-    one, two = urlsplit(first), urlsplit(second)
-
-    return (one.scheme, one.hostname, one.port) == (
-        two.scheme,
-        two.hostname,
-        two.port,
-    )
-
-
-def verify_deployment(settings: Settings, store) -> None:
-    """Check at boot what would otherwise fail under the first user.
-
-    A wrong bucket, a renamed Spyglass column, or a proxy that puts the broker
-    and the object store on one hostname all produce confusing failures much
-    later and to someone else. Checking here turns each into a startup error
-    naming its own cause.
-
-    Parameters
-    ----------
-    settings : Settings
-        Broker configuration.
-    store : ObjectStore
-        Adapter to probe.
-
-    Raises
-    ------
-    RuntimeError
-        If the lab schema or the bucket cannot be reached.
-    """
-    verify_lab_schema()
-    store.verify_store()
-
-    # A warning, not an error: it depends on `public_base_url` being set
-    # correctly, and refusing to boot on a heuristic is worse than saying so.
-    if same_origin(settings.public_base_url, settings.s3_endpoint_url):
-        logging.getLogger(__name__).warning(
-            "The broker and the object store share an origin (%s). Clients "
-            "keep Authorization across a same-origin redirect, and the store "
-            "will reject those requests with a complaint about "
-            "x-amz-content-sha256 rather than anything mentioning auth. Serve "
-            "them from different hostnames.",
-            settings.public_base_url,
-        )
-
-
-def client_ip(request: Request) -> str:
-    """Best-effort caller address.
-
-    Behind a reverse proxy every request appears to come from the proxy, so
-    the first `X-Forwarded-For` hop is preferred when present. That header is
-    caller-supplied and trivially forged — it is recorded for audit, never
-    used for a decision.
-    """
-    forwarded = request.headers.get("X-Forwarded-For", "")
-
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-
-    return request.client.host if request.client else ""
-
-
-def _require_possession(
-    request: Request,
-    body: FileRegistrationIn,
-    identity: Identity,
-    settings: Settings,
-    store,
-) -> None:
-    """Make a caller prove they hold content they cannot already read.
-
-    Registration deduplicates, so without this a caller who knows a digest can
-    register the content behind it under their own name and share it onward —
-    including content someone else keeps private. Prior access would become
-    permanent access, and revoking visibility would not take it back.
-
-    Nothing is asked when the caller can already read some registration of
-    this content: they could download it and upload it again, so a proof would
-    only cost them a round trip. Nothing is asked when the object is absent
-    either, because the upload itself proves possession — the store verifies
-    the bytes against the declared hash before accepting them.
-
-    Parameters
-    ----------
-    request : fastapi.Request
-        Incoming request, for audit.
-    body : FileRegistrationIn
-        The registration being attempted.
-    identity : Identity
-        The caller.
-    settings : Settings
-        Broker configuration.
-    store : ObjectStore
-        Where the challenged bytes are read from.
-
-    Raises
-    ------
-    fastapi.HTTPException
-        428 carrying the challenge when no proof was supplied, or 403 when
-        the answer is wrong.
-    """
-    if not settings.require_possession_proof:
-        return
-
-    key = object_key(body.sha256)
-
-    if not store.exists(key):
-        return  # they must upload, and the store checks the hash
-
-    readable = _pick_readable(
-        request,
-        list(request.app.state.registry.files_by_sha256(body.sha256)),
-        identity,
-    )
-
-    if readable is not None:
-        return  # they can already have these bytes
-
-    size = store.size(key) or 0
-    challenge = proof_challenge(identity.account_id, body.sha256, size)
-
-    if not body.possession_proof:
-        raise HTTPException(
-            status_code=status.HTTP_428_PRECONDITION_REQUIRED,
-            detail={
-                "detail": (
-                    "This content is already stored and you cannot read it. "
-                    "Answer the challenge to show you hold the file: digest "
-                    "the named byte range as "
-                    "sha256(f'{offset}:'.encode() + data)."
-                ),
-                "sha256": body.sha256,
-                "offset": challenge.offset,
-                "length": challenge.length,
-            },
-        )
-
-    actual = store.read_range(key, challenge.offset, challenge.length)
-    expected = proof_answer(actual or b"", challenge.offset)
-
-    if not secrets.compare_digest(body.possession_proof, expected):
-        request.app.state.registry.log_access(
-            identity=identity,
-            action="register",
-            granted=False,
-            source_ip=client_ip(request),
-        )
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Possession proof did not match. You do not hold this file.",
-        )
-
-
-def _pick_readable(
-    request: Request,
-    candidates: list[registry.FileRecord],
-    identity: Identity,
-) -> registry.FileRecord | None:
-    """Choose the registration that applies to this caller.
-
-    A Spyglass name is the primary key of a file table, so within an instance
-    it names exactly one file. Several registrations of that name are several
-    people's declarations about the same content, differing in owner and
-    visibility — so this is not a tie-break between rival answers, it is
-    picking the declaration the caller is party to.
-
-    Own registration first, then any readable one, in the order given (newest
-    first). None when the caller is party to none of them.
-    """
-    readable = []
-
-    for file in candidates:
-        rules = request.app.state.registry.rules_for_file(file.file_id)
-        if not may_read(rules, identity.as_reader(), file.owner):
-            continue
-        if file.owner == identity.account_id and identity.account_id:
-            return file
-        readable.append(file)
-
-    return readable[0] if readable else None
-
-
-def _authorize(
-    request: Request,
-    file: registry.FileRecord,
-    identity: Identity,
-    action: str,
-) -> None:
-    """Raise 403 unless `identity` may read `file`, recording either outcome.
-
-    The decision is logged here rather than at each call site so a denial can
-    never be the path that forgets to write one — a refusal is the event an
-    audit is most likely to be looking for.
-
-    Parameters
-    ----------
-    request : fastapi.Request
-        Incoming request, for the caller address.
-    file : FileRecord
-        The file being requested.
-    identity : Identity
-        The caller.
-    action : str
-        Log action: resolve or read.
-
-    Raises
-    ------
-    fastapi.HTTPException
-        403 when the caller may not read the file.
-    """
-    reg = request.app.state.registry
-    rules = reg.rules_for_file(file.file_id)
-    permitted = may_read(rules, identity.as_reader(), file.owner)
-
-    reg.log_access(
-        identity=identity,
-        action=action,
-        granted=permitted,
-        file_id=file.file_id,
-        # Charged only when a URL is actually issued; a refusal transfers
-        # nothing, and counting it would inflate quota against the wrong user.
-        size_bytes=file.size_bytes if permitted and action == "read" else 0,
-        source_ip=client_ip(request),
-    )
-
-    if not permitted:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="This identity may not read this file.",
-        )
-
-
-def _charged_size(store, file: registry.FileRecord) -> int:
-    """Return the size to bill for a file, preferring the store's answer.
-
-    The size on the registration is whatever the client declared, and nothing
-    verifies it — the checksum binds content, not length. Metering that number
-    would let an uploader register one byte for a ten gigabyte object and make
-    it free to read forever.
-
-    Falls back to the declared size if the store cannot say, so a storage
-    hiccup does not hand out free reads either.
-    """
-    try:
-        actual = store.size(object_key(file.sha256))
-    except Exception:  # noqa: BLE001 - a probe failure must not deny a read
-        actual = None
-
-    return actual if actual is not None else file.size_bytes
-
-
-def _enforce_quota(
-    request: Request,
-    identity: Identity,
-    file: registry.FileRecord,
-    settings: Settings,
-    store,
-    action: str = "read",
-) -> None:
-    """Raise 429 if this read would exceed the tier's allowance.
-
-    Charged when the URL is issued, because that is the last moment the broker
-    is involved. It cannot see whether the transfer happened, so the count is
-    what a reader was *permitted* to move, not what they did.
-
-    Parameters
-    ----------
-    request : fastapi.Request
-        Incoming request, for the caller address.
-    identity : Identity
-        The caller.
-    file : FileRecord
-        The file about to be handed out.
-    settings : Settings
-        Broker configuration.
-    store : ObjectStore
-        Consulted for the object's true size.
-    action : str, optional
-        "read" to charge the download allowance, "register" the upload one.
-
-    Raises
-    ------
-    fastapi.HTTPException
-        429, with `Retry-After` set to when capacity actually frees up.
-    """
-    limit = settings.volume_limit(action)
-
-    if limit is None or not identity.account_id:
-        return
-
-    reg = request.app.state.registry
-    usage = reg.usage_since(
-        identity.account_id, settings.quota_window_hours, action
-    )
-
-    # A file already charged in this window costs nothing more, so a streamed
-    # read that re-follows the redirect hundreds of times is billed once — and
-    # the size lookup below happens once per file per window rather than once
-    # per range request.
-    if file.file_id in usage.files:
-        return
-
-    charge = _charged_size(store, file)
-
-    if usage.total_bytes + charge <= limit:
-        return
-
-    window = timedelta(hours=settings.quota_window_hours)
-
-    # When the oldest counted read ages out, capacity returns. Saying so beats
-    # a fixed interval that has every client retry at the same moment.
-    retry = window.total_seconds()
-    if usage.earliest is not None:
-        retry = max(
-            1, (usage.earliest + window - datetime.now()).total_seconds()
-        )
-
-    reg.log_access(
-        identity=identity,
-        action=action,
-        granted=False,
-        source_ip=client_ip(request),
-    )
-
-    moved = "Upload" if action == "register" else "Download"
-
-    raise HTTPException(
-        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-        detail=(
-            f"{moved} allowance exhausted: "
-            f"{usage.total_bytes / 1024**4:.2f} of "
-            f"{limit / 1024**4:.2f} TB in the last "
-            f"{settings.quota_window_hours} hours."
-        ),
-        headers={"Retry-After": str(int(retry))},
-    )
 
 
 def create_app(

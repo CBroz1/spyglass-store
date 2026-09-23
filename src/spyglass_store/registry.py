@@ -36,7 +36,7 @@ import datajoint as dj
 
 from spyglass_store.access import AccessRule, Principal
 from spyglass_store.auth import Identity
-from spyglass_store.db import db_now, serialized
+from spyglass_store.db import db_now, serialized, window_start
 from spyglass_store.lab import teams_for_github
 
 
@@ -562,7 +562,7 @@ def recent_access(
     tuple of dict
     """
     AccessLog = _access_log()
-    since = db_now() - timedelta(hours=hours)
+    since = window_start(hours)
     query = AccessLog & f"timestamp >= '{since:%Y-%m-%d %H:%M:%S}'"
 
     if account_id:
@@ -662,11 +662,44 @@ class Usage(NamedTuple):
     files: frozenset[str]
 
 
+#: One row per distinct file charged in the window, carrying the window's
+#: totals. Both aggregations happen in SQL, and they have to happen in one
+#: statement because the caller needs the totals *and* the file ids: the inner
+#: `GROUP BY` collapses a file's many read events into the single charge quota
+#: counts, and the window functions total those charges across files.
+#:
+#: `MAX(size_bytes)` rather than any particular row: the sizes recorded for one
+#: file are the store's answer for the same object and so agree, and where a
+#: declared size once stood in they do not — taking the largest errs toward
+#: charging more, which is the safe direction for a guardrail.
+#:
+#: A charge with no `file_id` is excluded. It could never match the caller's
+#: already-charged check, so it would be billed again on every request. Nothing
+#: writes such a row today; excluding it here keeps that true.
+_USAGE_SQL = """
+SELECT charged.file_id,
+       SUM(charged.size_bytes) OVER () AS total_bytes,
+       MIN(charged.first_read)  OVER () AS earliest
+FROM (
+    SELECT file_id,
+           MAX(size_bytes) AS size_bytes,
+           MIN(timestamp)  AS first_read
+    FROM {table}
+    WHERE account_id = %s
+      AND action     = %s
+      AND granted    = 1
+      AND file_id IS NOT NULL
+      AND timestamp >= %s
+    GROUP BY file_id
+) AS charged
+"""
+
+
 @serialized
 def usage_since(
     account_id: str, window_hours: int, action: str = "read"
 ) -> Usage:
-    """Return what an account has been charged for reads since `since`.
+    """Return what an account has been charged in a rolling window.
 
     **Counted per distinct file, not per request.** A stable content URL
     re-signs on every call, so streaming one file with range requests produces
@@ -679,8 +712,14 @@ def usage_since(
     file inside the window is free, which is the right answer anyway — the
     reader could have kept the first copy.
 
-    Only granted reads count. A refusal transfers nothing, and a resolve hands
-    out a name rather than bytes.
+    Only granted rows for the named action count. A refusal transfers nothing,
+    a resolve hands out a name rather than bytes, and an upload is charged
+    against a different allowance than a download.
+
+    **MySQL does the folding.** The log grows with requests, not with files, so
+    reading it row by row to sum in Python made a cheap check scale with how
+    hard the account had been hammering the service. What comes back now is one
+    row per distinct file, which is quota's own unit; see `_USAGE_SQL`.
 
     The window is measured against the database's clock rather than the
     broker host's. `datetime.now()` is naive and local; MySQL stores these
@@ -701,39 +740,24 @@ def usage_since(
     Usage
     """
     AccessLog = _access_log()
-    since = db_now() - timedelta(hours=window_hours)
 
-    query = (
-        AccessLog
-        & {
-            "account_id": int(account_id),
-            "action": "read",
-            "granted": 1,
-        }
-        & f"timestamp >= '{since:%Y-%m-%d %H:%M:%S}'"
-    )
-
-    rows = [
-        row
-        for row in query.fetch(
-            "file_id", "size_bytes", "timestamp", as_dict=True
+    rows = (
+        dj.conn()
+        .query(
+            _USAGE_SQL.format(table=AccessLog.full_table_name),
+            (int(account_id), action, window_start(window_hours)),
+            as_dict=True,
         )
-        # A charge with no file id could never be matched by the
-        # already-charged check, so it would be billed again on every request.
-        # Nothing writes such a row today; skipping it keeps that true.
-        if row["file_id"] is not None
-    ]
+        .fetchall()
+    )
 
     if not rows:
         return Usage(0, None, frozenset())
 
-    # One entry per file; sizes for a given file are identical, so any wins.
-    per_file = {row["file_id"]: int(row["size_bytes"]) for row in rows}
-
     return Usage(
-        total_bytes=sum(per_file.values()),
-        earliest=min(row["timestamp"] for row in rows),
-        files=frozenset(per_file),
+        total_bytes=int(rows[0]["total_bytes"]),
+        earliest=rows[0]["earliest"],
+        files=frozenset(row["file_id"] for row in rows),
     )
 
 
