@@ -95,6 +95,18 @@ class Settings(BaseSettings):
     #: one hash and uploaded as another.
     s3_enforce_upload_checksum: bool = True
 
+    #: Require a caller claiming already-stored content to prove they hold
+    #: the bytes, when they cannot already read any registration of it.
+    #:
+    #: Without this, knowing a hash is enough to claim the content behind it:
+    #: registration deduplicates, so a caller who once had a file — or who
+    #: learned its digest any other way — can register it under their own name
+    #: and share it onward. Revocation would not take it back.
+    #:
+    #: Turning it off restores that hole. Only sensible where every account is
+    #: already trusted with every file.
+    require_possession_proof: bool = True
+
     #: Lifetime of a presigned URL. Short, because an issued URL cannot be
     #: revoked; see the metering notes in the design docs.
     presigned_ttl_seconds: int = 300

@@ -13,6 +13,7 @@ naming conventions can be reorganized without moving a single object.
 from __future__ import annotations
 
 import base64
+import hashlib
 import re
 from typing import NamedTuple, Protocol, runtime_checkable
 
@@ -111,6 +112,85 @@ def checksum_header(sha256: str) -> str:
     return base64.b64encode(bytes.fromhex(sha256)).decode()
 
 
+#: Bytes sampled for a possession challenge. Small on purpose: the point is
+#: to prove the caller holds the file, and reading more proves nothing extra
+#: while making the broker's own read less trivially bounded.
+PROOF_LENGTH = 64
+
+
+class PossessionChallenge(NamedTuple):
+    """A range of a file that only its holder can answer for.
+
+    Attributes
+    ----------
+    offset : int
+        Byte offset into the object.
+    length : int
+        Number of bytes to digest.
+    """
+
+    offset: int
+    length: int
+
+
+def proof_challenge(
+    account_id: str, sha256: str, size_bytes: int
+) -> PossessionChallenge:
+    """Return the byte range this account must digest to claim this content.
+
+    Derived from the account and the hash rather than stored, so a challenge
+    survives a restart and needs no table. The offset is not a secret — the
+    security comes from needing the bytes, which a caller holding only a hash
+    does not have.
+
+    Deterministic per account so a retry asks the same question. Different per
+    account so one person's answer cannot be forwarded to another.
+
+    Parameters
+    ----------
+    account_id : str
+        Account being challenged.
+    sha256 : str
+        Content hash being claimed.
+    size_bytes : int
+        Size of the stored object.
+
+    Returns
+    -------
+    PossessionChallenge
+    """
+    length = min(PROOF_LENGTH, max(size_bytes, 1))
+    span = max(size_bytes - length, 0)
+
+    if span == 0:
+        return PossessionChallenge(0, length)
+
+    seed = hashlib.sha256(f"{account_id}:{sha256}".encode()).digest()
+
+    return PossessionChallenge(int.from_bytes(seed[:8], "big") % span, length)
+
+
+def proof_answer(data: bytes, offset: int) -> str:
+    """Return the expected answer for a challenge over `data`.
+
+    The offset is folded in so an answer for one range cannot be replayed as
+    the answer for another over the same file.
+
+    Parameters
+    ----------
+    data : bytes
+        The challenged bytes.
+    offset : int
+        Where they came from.
+
+    Returns
+    -------
+    str
+        Hex digest.
+    """
+    return hashlib.sha256(f"{offset}:".encode() + data).hexdigest()
+
+
 @runtime_checkable
 class ObjectStore(Protocol):
     """An S3-compatible object store.
@@ -127,6 +207,18 @@ class ObjectStore(Protocol):
 
     def presigned_get(self, key: str, ttl_seconds: int) -> str:
         """Return a time-limited URL for reading `key`."""
+        ...
+
+    def read_range(self, key: str, offset: int, length: int) -> bytes | None:
+        """Return `length` bytes of `key` from `offset`, or None if absent.
+
+        The one place the broker reads object data, and deliberately bounded
+        to `PROOF_LENGTH` bytes by its only caller. It exists so a caller
+        claiming content they cannot already read has to prove they hold it;
+        without it, knowing a hash would be enough to claim the bytes behind
+        it. That is a different thing from standing in the data path, which
+        remains something this service never does.
+        """
         ...
 
     def size(self, key: str) -> int | None:

@@ -137,7 +137,23 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
-          description: This tier may not upload
+          description: |
+            This tier may not upload, or a possession proof was wrong.
+        "428":
+          description: |
+            The content is already stored and this identity cannot read it, so
+            possession must be proved before claiming it. The body carries the
+            byte range to digest; retry with `possession_proof` set to
+            `sha256(f"{offset}:".encode() + data)`.
+
+            Registration deduplicates, so without this a caller who merely
+            knew a digest could claim the content behind it and share it
+            onward — and revoking the original visibility would not take it
+            back.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PossessionChallenge"
         "429":
           $ref: "#/components/responses/Throttled"
 
@@ -324,6 +340,26 @@ components:
           enum: [raw, analysis]
         visibility:
           $ref: "#/components/schemas/Visibility"
+        possession_proof:
+          type: string
+          description: |
+            Answer to a prior 428 challenge. Needed only when claiming content
+            already stored that this identity cannot read.
+
+    PossessionChallenge:
+      type: object
+      required: [detail, sha256, offset, length]
+      properties:
+        detail:
+          type: string
+        sha256:
+          $ref: "#/components/schemas/Sha256"
+        offset:
+          type: integer
+          description: First byte of the range to digest.
+        length:
+          type: integer
+          description: How many bytes.
 
     UploadTarget:
       type: object

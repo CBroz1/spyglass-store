@@ -160,8 +160,18 @@ def files_by_name(spyglass_name: str) -> tuple[FileRecord, ...]:
 
 
 @serialized
-def file_by_sha256(sha256: str) -> FileRecord | None:
-    """Return the file with this content hash, or None.
+def files_by_sha256(sha256: str) -> tuple[FileRecord, ...]:
+    """Return every registration of this content, newest first.
+
+    Like `files_by_name`, and for the same reason: a hash is not a unique key
+    here either. Deduplication is the designed-for case — two owners
+    registering identical bytes each get a registration, sharing one object —
+    so a hash lookup has as many rows as people who registered it.
+
+    Returning one arbitrary row would be worse here than for a name. A hash
+    identifies the *content* exactly, so every row is genuinely the file the
+    caller asked for; picking one and finding it unreadable would refuse a
+    caller who is party to a different registration of the very same bytes.
 
     Parameters
     ----------
@@ -170,11 +180,14 @@ def file_by_sha256(sha256: str) -> FileRecord | None:
 
     Returns
     -------
-    FileRecord or None
+    tuple of FileRecord
     """
     _, File, _ = tables()
+    rows = (File & {"sha256": sha256}).fetch(
+        as_dict=True, order_by="registered DESC"
+    )
 
-    return _record(_one(File & {"sha256": sha256}))
+    return tuple(_record(row) for row in rows)
 
 
 @serialized

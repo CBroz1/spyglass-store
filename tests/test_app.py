@@ -69,6 +69,9 @@ class _Store:
     def size(self, key):
         return None  # falls back to the declared size
 
+    def read_range(self, key, offset, length):  # pragma: no cover
+        return b""
+
     def presigned_put(self, key, ttl, sha256=None):
         from spyglass_store.storage import PresignedUpload, checksum_header
 
@@ -110,8 +113,8 @@ class _Registry:
     def files_by_name(self, name):
         return (OWNER,) if name == OWNER.spyglass_name else ()
 
-    def file_by_sha256(self, sha):
-        return OWNER if sha == OWNER.sha256 else None
+    def files_by_sha256(self, sha):
+        return (OWNER,) if sha == OWNER.sha256 else ()
 
     def rules_for_file(self, file_id):
         return self.rules
@@ -157,7 +160,13 @@ def client(store, reg):
         store=store,
         github=object(),
         registry_module=reg,
-        settings=Settings(presigned_ttl_seconds=300),
+        settings=Settings(
+            presigned_ttl_seconds=300,
+            # Off here: the fake store holds no bytes, so a challenge over it
+            # would prove nothing. Possession is covered in test_end_to_end
+            # against a real store, where an answer means something.
+            require_possession_proof=False,
+        ),
     )
 
     return TestClient(app)

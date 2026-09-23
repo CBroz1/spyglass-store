@@ -55,6 +55,9 @@ def test_object_store_protocol_is_structural() -> None:
         def size(self, key: str) -> int | None:
             return 0
 
+        def read_range(self, key: str, offset: int, length: int) -> bytes:
+            return b""
+
         def presigned_put(self, key: str, ttl_seconds: int) -> str:
             return "https://example.invalid/put"
 

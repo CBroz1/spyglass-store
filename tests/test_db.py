@@ -111,7 +111,7 @@ def test_file_lookups_agree(db, registered):
 
     by_id = registry.file_by_id(registered)
     by_name = registry.files_by_name("session1_.nwb")[0]
-    by_sha = registry.file_by_sha256("a" * 64)
+    by_sha = registry.files_by_sha256("a" * 64)[0]
 
     assert by_id == by_name == by_sha
     assert by_id.size_bytes == 2048

@@ -99,6 +99,23 @@ missing `x-amz-content-sha256`, which reads nothing like an auth error.
 This is a deployment property, so the code can only warn. It does, at startup,
 when `SPYGLASS_STORE_PUBLIC_BASE_URL` is set.
 
+### Claiming stored content requires holding it
+
+Registration deduplicates: a hash already in the store needs no upload. That
+makes a digest a claim on the bytes behind it, so a caller who once read a file
+— or learned its hash any other way — could register it under their own name and
+share it onward, and revoking the original visibility would not take it back.
+
+So a caller who cannot already read any registration of that content must answer
+a challenge over a named byte range before claiming it. Nothing is asked of
+someone who can already read it (they could download and re-upload anyway), nor
+when the object is absent (the upload itself proves possession, since the store
+verifies the hash).
+
+This is the one place the broker reads object data, bounded to
+`storage.PROOF_LENGTH` bytes. That is a deliberate, stated exception to staying
+out of the data path — it is a security check, not a transfer.
+
 ### Spyglass's lab tables are trust roots
 
 `LabMember.LabMemberInfo` decides who is a verified account and may upload.

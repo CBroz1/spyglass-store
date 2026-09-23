@@ -129,6 +129,37 @@ class S3ObjectStore:
 
         return True
 
+    def read_range(self, key: str, offset: int, length: int) -> bytes | None:
+        """Return a bounded range of an object, or None if it is absent.
+
+        Parameters
+        ----------
+        key : str
+            Object key.
+        offset : int
+            First byte to read.
+        length : int
+            How many bytes.
+
+        Returns
+        -------
+        bytes or None
+        """
+        last = offset + length - 1
+
+        try:
+            response = self._client.get_object(
+                Bucket=self.settings.s3_bucket,
+                Key=key,
+                Range=f"bytes={offset}-{last}",
+            )
+        except Exception as err:  # noqa: BLE001 - botocore errors vary
+            if _is_not_found(err):
+                return None
+            raise
+
+        return response["Body"].read()
+
     def size(self, key: str) -> int | None:
         """Return the stored size of `key`, or None if it is not there.
 

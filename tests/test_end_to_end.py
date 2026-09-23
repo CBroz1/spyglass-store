@@ -175,7 +175,13 @@ def test_a_non_member_is_refused_the_same_file(client, accounts):
 
 
 def test_re_registering_the_same_bytes_skips_the_upload(client, accounts):
-    """Dedup, end to end: the second registration gets no upload URL."""
+    """Dedup, end to end: the second registration gets no upload URL.
+
+    Bob holds the same file and proves it, since Ada's copy is private. See
+    the possession tests below for why that proof is required.
+    """
+    from spyglass_store.storage import proof_answer
+
     body = {
         "sha256": SHA,
         "size_bytes": len(PAYLOAD),
@@ -192,10 +198,20 @@ def test_re_registering_the_same_bytes_skips_the_upload(client, accounts):
         headers=first["upload_headers"],
     ).raise_for_status()
 
-    # Bob registers the identical content under his own name.
+    bobs = {**body, "spyglass_name": "bobs_copy_.nwb"}
+    challenge = client.post(
+        "/api/v1/file", json=bobs, headers=auth(accounts, "bob")
+    ).json()["detail"]
+    offset, length = challenge["offset"], challenge["length"]
+
     second = client.post(
         "/api/v1/file",
-        json={**body, "spyglass_name": "bobs_copy_.nwb"},
+        json={
+            **bobs,
+            "possession_proof": proof_answer(
+                PAYLOAD[offset : offset + length], offset
+            ),
+        },
         headers=auth(accounts, "bob"),
     ).json()
 
@@ -392,3 +408,198 @@ def test_resolve_prefers_the_callers_own_registration(client, accounts):
             headers=auth(accounts, who),
         )
         assert got.json()["file_id"] == expected["file_id"]
+
+
+def test_resolving_by_hash_finds_the_callers_own_registration(client, accounts):
+    """A hash is not a unique key either — dedup is the designed-for case.
+
+    Two owners registering identical bytes share one object and hold separate
+    registrations. Returning whichever row the database offered first would
+    refuse a caller who is party to the other one, for content they can
+    demonstrably read.
+    """
+    body = {
+        "sha256": SHA,
+        "size_bytes": len(PAYLOAD),
+        "spyglass_name": NAME,
+        "file_class": "raw",
+    }
+
+    ada = client.post(
+        "/api/v1/file", json=body, headers=auth(accounts, "ada")
+    ).json()
+    bob = client.post(
+        "/api/v1/file",
+        json={**body, "spyglass_name": "bobs_copy_.nwb"},
+        headers=auth(accounts, "bob"),
+    ).json()
+
+    assert ada["file_id"] != bob["file_id"]
+
+    for who, expected in (("ada", ada), ("bob", bob)):
+        got = client.get(
+            "/api/v1/file/resolve",
+            params={"sha256": SHA},
+            headers=auth(accounts, who),
+        )
+        assert got.status_code == 200, f"{who} could not resolve by hash"
+        assert got.json()["file_id"] == expected["file_id"]
+
+
+def test_a_private_registration_does_not_mask_a_readable_one(client, accounts):
+    """The failure the single-row lookup produced, pinned.
+
+    Ada registers privately; Bob registers the same bytes and shares them with
+    teamA. Mallory is on no team, so she still gets nothing — but Bob must not
+    be refused because Ada's private row happened to be returned first.
+    """
+    body = {
+        "sha256": SHA,
+        "size_bytes": len(PAYLOAD),
+        "spyglass_name": NAME,
+        "file_class": "raw",
+    }
+
+    client.post("/api/v1/file", json=body, headers=auth(accounts, "ada"))
+    client.post(
+        "/api/v1/file",
+        json={
+            **body,
+            "spyglass_name": "shared_.nwb",
+            "visibility": {"scope": "group", "teams": ["teamA"]},
+        },
+        headers=auth(accounts, "bob"),
+    )
+
+    readable = client.get(
+        "/api/v1/file/resolve",
+        params={"sha256": SHA},
+        headers=auth(accounts, "bob"),
+    )
+    refused = client.get(
+        "/api/v1/file/resolve",
+        params={"sha256": SHA},
+        headers=auth(accounts, "mallory"),
+    )
+
+    assert readable.status_code == 200
+    assert refused.status_code == 404
+
+
+# ------------------------ proof of possession ------------------------
+
+
+def _register(client, accounts, who, **overrides):
+    """Attempt a registration, returning the raw response."""
+    body = {
+        "sha256": SHA,
+        "size_bytes": len(PAYLOAD),
+        "spyglass_name": f"{who}_copy_.nwb",
+        "file_class": "raw",
+        **overrides,
+    }
+
+    return client.post("/api/v1/file", json=body, headers=auth(accounts, who))
+
+
+def _ada_uploads_privately(client, accounts):
+    """Ada registers and uploads a file nobody else may read."""
+    target = _register(client, accounts, "ada").json()
+    httpx.put(
+        target["upload_url"],
+        content=PAYLOAD,
+        headers=target["upload_headers"],
+    ).raise_for_status()
+
+    return target
+
+
+def test_knowing_a_hash_is_not_enough_to_claim_the_content(client, accounts):
+    """The revocation bypass, closed.
+
+    Deduplication means a registration of already-stored content needs no
+    upload. Without a possession check, anyone who learned a digest — from an
+    access they once had, or a log, or predictable content — could register it
+    under their own name and share it onward, and revoking the original
+    visibility would not take it back.
+    """
+    _ada_uploads_privately(client, accounts)
+
+    # Bob has the digest and nothing else.
+    refused = _register(client, accounts, "bob")
+
+    assert refused.status_code == 428
+    challenge = refused.json()["detail"]
+    assert challenge["sha256"] == SHA
+    assert challenge["length"] > 0
+
+
+def test_a_wrong_answer_is_refused(client, accounts):
+    """Guessing must not work either."""
+    _ada_uploads_privately(client, accounts)
+
+    refused = _register(client, accounts, "bob", possession_proof="0" * 64)
+
+    assert refused.status_code == 403
+    assert "do not hold this file" in refused.json()["detail"]
+
+
+def test_someone_who_holds_the_file_can_register_it(client, accounts):
+    """The check must not punish a legitimate second owner.
+
+    Two people independently holding the same session is ordinary — a shared
+    drive, a collaborator, a re-download. They answer the challenge from their
+    own copy and register normally.
+    """
+    from spyglass_store.storage import proof_answer
+
+    _ada_uploads_privately(client, accounts)
+
+    challenged = _register(client, accounts, "bob")
+    challenge = challenged.json()["detail"]
+
+    # Bob reads the named range out of the file he actually has.
+    offset, length = challenge["offset"], challenge["length"]
+    answer = proof_answer(PAYLOAD[offset : offset + length], offset)
+
+    allowed = _register(client, accounts, "bob", possession_proof=answer)
+
+    assert allowed.status_code == 201
+    assert allowed.json()["deduplicated"] is True, "still one object"
+
+
+def test_no_proof_is_asked_of_someone_who_can_already_read_it(client, accounts):
+    """A proof would only cost a round trip to someone who could download it.
+
+    Ada shares with teamA, so Bob can already fetch these bytes. Asking him to
+    prove he holds them protects nothing.
+    """
+    target = _register(
+        client,
+        accounts,
+        "ada",
+        visibility={"scope": "group", "teams": ["teamA"]},
+    ).json()
+    httpx.put(
+        target["upload_url"],
+        content=PAYLOAD,
+        headers=target["upload_headers"],
+    ).raise_for_status()
+
+    assert _register(client, accounts, "bob").status_code == 201
+
+
+def test_the_owner_can_re_register_without_a_proof(client, accounts):
+    """Idempotent retry must not turn into a challenge."""
+    _ada_uploads_privately(client, accounts)
+
+    assert _register(client, accounts, "ada").status_code == 201
+
+
+def test_first_upload_needs_no_proof(client, accounts):
+    """Nothing is stored yet, so the upload itself proves possession.
+
+    The store verifies the bytes against the declared hash before accepting
+    them, which is a stronger check than the challenge.
+    """
+    assert _register(client, accounts, "ada").status_code == 201

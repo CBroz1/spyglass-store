@@ -30,6 +30,7 @@ is a natural thing for a reverse proxy to do by accident.
 from __future__ import annotations
 
 import logging
+import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Annotated, Literal
@@ -55,7 +56,11 @@ from spyglass_store.github import (
 from spyglass_store.lab import lab_member_for_github, verify_lab_schema
 from spyglass_store.s3 import S3ObjectStore
 from spyglass_store.settings import Settings, get_settings
-from spyglass_store.storage import object_key
+from spyglass_store.storage import (
+    object_key,
+    proof_answer,
+    proof_challenge,
+)
 
 API_PREFIX = "/api/v1"
 
@@ -87,6 +92,14 @@ class FileRegistrationIn(BaseModel):
     file_class: Literal["raw", "analysis"]
     visibility: VisibilityIn = Field(
         default_factory=lambda: VisibilityIn(scope="private")
+    )
+    possession_proof: str | None = Field(
+        default=None,
+        description=(
+            "Digest answering the challenge from a prior 428. Required only "
+            "when claiming content already stored that this identity cannot "
+            "already read."
+        ),
     )
 
 
@@ -120,6 +133,15 @@ class VisibilityOut(BaseModel):
     file_id: str
     scope: str
     teams: list[str]
+
+
+class PossessionRequired(BaseModel):
+    """What a caller must answer to claim content already in the store."""
+
+    detail: str
+    sha256: str
+    offset: int
+    length: int
 
 
 class UploadTarget(BaseModel):
@@ -213,6 +235,97 @@ def client_ip(request: Request) -> str:
         return forwarded.split(",")[0].strip()
 
     return request.client.host if request.client else ""
+
+
+def _require_possession(
+    request: Request,
+    body: FileRegistrationIn,
+    identity: Identity,
+    settings: Settings,
+    store,
+) -> None:
+    """Make a caller prove they hold content they cannot already read.
+
+    Registration deduplicates, so without this a caller who knows a digest can
+    register the content behind it under their own name and share it onward —
+    including content someone else keeps private. Prior access would become
+    permanent access, and revoking visibility would not take it back.
+
+    Nothing is asked when the caller can already read some registration of
+    this content: they could download it and upload it again, so a proof would
+    only cost them a round trip. Nothing is asked when the object is absent
+    either, because the upload itself proves possession — the store verifies
+    the bytes against the declared hash before accepting them.
+
+    Parameters
+    ----------
+    request : fastapi.Request
+        Incoming request, for audit.
+    body : FileRegistrationIn
+        The registration being attempted.
+    identity : Identity
+        The caller.
+    settings : Settings
+        Broker configuration.
+    store : ObjectStore
+        Where the challenged bytes are read from.
+
+    Raises
+    ------
+    fastapi.HTTPException
+        428 carrying the challenge when no proof was supplied, or 403 when
+        the answer is wrong.
+    """
+    if not settings.require_possession_proof:
+        return
+
+    key = object_key(body.sha256)
+
+    if not store.exists(key):
+        return  # they must upload, and the store checks the hash
+
+    readable = _pick_readable(
+        request,
+        list(request.app.state.registry.files_by_sha256(body.sha256)),
+        identity,
+    )
+
+    if readable is not None:
+        return  # they can already have these bytes
+
+    size = store.size(key) or 0
+    challenge = proof_challenge(identity.account_id, body.sha256, size)
+
+    if not body.possession_proof:
+        raise HTTPException(
+            status_code=status.HTTP_428_PRECONDITION_REQUIRED,
+            detail={
+                "detail": (
+                    "This content is already stored and you cannot read it. "
+                    "Answer the challenge to show you hold the file: digest "
+                    "the named byte range as "
+                    "sha256(f'{offset}:'.encode() + data)."
+                ),
+                "sha256": body.sha256,
+                "offset": challenge.offset,
+                "length": challenge.length,
+            },
+        )
+
+    actual = store.read_range(key, challenge.offset, challenge.length)
+    expected = proof_answer(actual or b"", challenge.offset)
+
+    if not secrets.compare_digest(body.possession_proof, expected):
+        request.app.state.registry.log_access(
+            identity=identity,
+            action="register",
+            granted=False,
+            source_ip=client_ip(request),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Possession proof did not match. You do not hold this file.",
+        )
 
 
 def _pick_readable(
@@ -558,12 +671,13 @@ def create_app(
                 detail="One of name or sha256 is required.",
             )
 
-        candidates = (
-            [app.state.registry.file_by_sha256(sha256)]
+        # Both lookups return every registration, not one: a name and a hash
+        # are each non-unique, and the caller is party to at most one of them.
+        candidates = list(
+            app.state.registry.files_by_sha256(sha256)
             if sha256
-            else list(app.state.registry.files_by_name(name))
+            else app.state.registry.files_by_name(name)
         )
-        candidates = [c for c in candidates if c is not None]
 
         file = _pick_readable(request, candidates, identity)
 
@@ -639,6 +753,8 @@ def create_app(
             app.state.store,
             action="register",
         )
+
+        _require_possession(request, body, identity, settings, app.state.store)
 
         key = object_key(body.sha256)
 
