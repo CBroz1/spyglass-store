@@ -18,6 +18,7 @@ import logging
 from urllib.parse import urlsplit
 
 from spyglass_store.lab import verify_lab_schema
+from spyglass_store.nwbfile import verify_nwbfile_schema
 from spyglass_store.settings import Settings
 
 
@@ -60,9 +61,11 @@ def verify_deployment(settings: Settings, store) -> None:
     Raises
     ------
     RuntimeError
-        If the lab schema or the bucket cannot be reached.
+        If either reflected Spyglass schema is missing a column the broker
+        reads, or the bucket cannot be reached.
     """
     verify_lab_schema()
+    verify_nwbfile_schema()
     store.verify_store()
 
     # A warning, not an error: it depends on `public_base_url` being set

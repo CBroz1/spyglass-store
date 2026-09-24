@@ -95,6 +95,15 @@ class Settings(BaseSettings):
     #: one hash and uploaded as another.
     s3_enforce_upload_checksum: bool = True
 
+    #: Does this store verify `x-amz-checksum-sha256` against the bytes it
+    #: receives? True for MinIO and Cloudflare R2; False for Ceph RGW, which
+    #: signs the header and ignores it.
+    #:
+    #: Defaults to False, the safe assumption. It enforces nothing itself — it
+    #: is reported by `GET /info`, so a client knows whether to spend a second
+    #: pass computing an MD5 the store will actually check.
+    s3_store_verifies_sha256: bool = False
+
     #: Require a caller claiming already-stored content to prove they hold
     #: the bytes, when they cannot already read any registration of it.
     #:

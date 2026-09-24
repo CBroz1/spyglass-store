@@ -43,8 +43,26 @@ class FileRegistrationIn(BaseModel):
     size_bytes: int = Field(ge=0)
     spyglass_name: str
     file_class: Literal["raw", "analysis"]
-    visibility: VisibilityIn = Field(
-        default_factory=lambda: VisibilityIn(scope="private")
+    visibility: VisibilityIn | None = Field(
+        default=None,
+        description=(
+            "Who may read the file. Omit it and the broker decides: a raw "
+            "file becomes public, and an analysis file takes the visibility "
+            "of the raw it was derived from, following it as that changes. "
+            "Send a scope and it is honoured exactly — including one wider "
+            "than the raw's, which is a choice the owner is allowed to make."
+        ),
+    )
+    content_md5: str | None = Field(
+        default=None,
+        pattern="^[0-9a-f]{32}$",
+        description=(
+            "Hex MD5 of the same bytes. Optional, and worth sending: the "
+            "broker signs it into the upload URL as Content-MD5, which some "
+            "stores enforce even where they ignore the SHA-256 checksum. "
+            "Omitted, upload integrity depends entirely on the store honouring "
+            "x-amz-checksum-sha256."
+        ),
     )
     possession_proof: str | None = Field(
         default=None,
@@ -53,6 +71,27 @@ class FileRegistrationIn(BaseModel):
             "when claiming content already stored that this identity cannot "
             "already read."
         ),
+    )
+
+
+class ServerInfo(BaseModel):
+    """What a client needs to know about this deployment before uploading.
+
+    Exists so the client does not have to guess, and does not have to compute
+    a digest nobody will check. Hashing a multi-gigabyte NWB file twice to
+    satisfy a store that verifies neither digest is pure waste, and hashing it
+    once when the store needs the other one is worse.
+    """
+
+    api_version: str
+    upload_digests: list[str] = Field(
+        description=(
+            "Digests to compute and send when registering a file, in the "
+            "order they appear in the registration body's field names. "
+            "Always includes sha256, which is the object's address whatever "
+            "the store does with it; includes md5 when the store will not "
+            "verify the sha256 checksum itself."
+        )
     )
 
 

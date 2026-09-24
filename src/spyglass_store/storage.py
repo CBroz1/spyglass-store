@@ -77,6 +77,10 @@ class PresignedUpload(NamedTuple):
     headers: dict[str, str]
 
 
+#: A hex MD5, as a client reports it.
+_MD5_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
 def checksum_header(sha256: str) -> str:
     """Return the value S3 expects in `x-amz-checksum-sha256`.
 
@@ -110,6 +114,46 @@ def checksum_header(sha256: str) -> str:
         )
 
     return base64.b64encode(bytes.fromhex(sha256)).decode()
+
+
+def md5_header(md5: str) -> str:
+    """Return the value S3 expects in `Content-MD5`.
+
+    The older integrity header, and the only one some stores honour — Ceph RGW
+    ignores the SHA-256 checksum and enforces this. So the broker sends both
+    when it can, and each store enforces the strongest check it understands.
+
+    **MD5 is a corruption check, not a security control.** Collisions are
+    constructible, so it catches a truncated or corrupted transfer and not a
+    deliberate substitution. Where the store honours the SHA-256 checksum, that
+    stronger check still applies.
+
+    Parameters
+    ----------
+    md5 : str
+        Lowercase hex digest, 32 characters.
+
+    Returns
+    -------
+    str
+        Base64 of the same digest.
+
+    Raises
+    ------
+    ValueError
+        If the digest is not 32 lowercase hex characters.
+
+    Examples
+    --------
+    >>> md5_header("0" * 32)
+    'AAAAAAAAAAAAAAAAAAAAAA=='
+    """
+    if not _MD5_RE.match(md5):
+        raise ValueError(
+            f"Expected a 32-character lowercase hex digest, got: {md5!r}"
+        )
+
+    return base64.b64encode(bytes.fromhex(md5)).decode()
 
 
 #: Bytes sampled for a possession challenge. Small on purpose: the point is

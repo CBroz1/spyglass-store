@@ -43,7 +43,13 @@ S3_NAME = "broker-pytest-s3"
 # Pinned to a release rather than `latest` for the same reason the move caught
 # us: a moving tag lets an upstream change break CI with no commit here. Bump
 # it deliberately.
-S3_IMAGE = "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
+#: Ceph RGW: the implementation the deployment targets, so the suite meets the
+#: same one. Pinned by digest — `demo` has no release tags, and a digest cannot
+#: be re-pointed under us.
+S3_IMAGE = (
+    "quay.io/ceph/demo@sha256:"
+    "522483cf07cfce6386b8e18a3edfa88a1b32c688dee231d0a6962b1513557723"
+)
 S3_USER = "spyglasstest"
 S3_PASSWORD = "spyglasstestsecret"  # MinIO requires at least 8 characters
 S3_BUCKET = "spyglass-store-test"
@@ -276,23 +282,51 @@ class MySQLContainer(_Container):
 
 
 class S3Container(_Container):
-    """A MinIO server, standing in for the deployed object store."""
+    """A single-node Ceph cluster with RGW, matching the deployment target.
+
+    Heavier than a toy S3 — a gigabyte of image, about a minute to a serving
+    RGW — and worth it: the broker meets this implementation in production, and
+    the ways it differs from MinIO are not ones a stand-in would show.
+    """
 
     image = S3_IMAGE
-    internal_port = 9000
+    #: RGW's frontend, not MinIO's 9000.
+    internal_port = 8080
 
-    data_dir = "/data"
+    data_dir = "/var/lib/ceph"
 
     def __init__(self, name: str = S3_NAME, keep: bool = False, vol_dir=None):
         super().__init__(name, keep, vol_dir)
 
     def run_kwargs(self) -> dict:
-        """Serve `/data` with root credentials from the environment."""
+        """Bring up mon, osd, and rgw, with the demo user already created.
+
+        The entrypoint is wrapped because the image demands `MON_IP`, which is
+        not knowable until the container is running — so the wrapper reads it
+        from inside and hands over to the image's real entrypoint.
+        `NETWORK_AUTO_DETECT` is documented to do this and does not here.
+
+        `OSD_TYPE=directory` keeps the OSD on the filesystem. The alternative
+        wants a raw device, which a test run has no business asking for.
+        """
         return {
-            "command": "server /data",
+            "entrypoint": [
+                "/bin/bash",
+                "-c",
+                "export MON_IP=$(hostname -i | awk '{print $1}'); "
+                "export CEPH_PUBLIC_NETWORK=$(hostname -i "
+                '| awk \'{split($1,a,"."); print a[1]"."a[2]".0.0/16"}\'); '
+                "exec /opt/ceph-container/bin/demo",
+            ],
             "environment": [
-                f"MINIO_ROOT_USER={S3_USER}",
-                f"MINIO_ROOT_PASSWORD={S3_PASSWORD}",
+                "DEMO_DAEMONS=mon,osd,rgw",
+                "OSD_TYPE=directory",
+                "RGW_NAME=localhost",
+                f"RGW_FRONTEND_PORT={self.internal_port}",
+                "CEPH_DEMO_UID=broker",
+                f"CEPH_DEMO_ACCESS_KEY={S3_USER}",
+                f"CEPH_DEMO_SECRET_KEY={S3_PASSWORD}",
+                f"CEPH_DEMO_BUCKET={S3_BUCKET}",
             ],
         }
 
@@ -302,16 +336,21 @@ class S3Container(_Container):
         return f"http://127.0.0.1:{self.port}"
 
     def ready(self) -> bool:
-        """Poll MinIO's liveness endpoint.
+        """Ask RGW whether it is serving.
 
-        The image carries no Docker healthcheck, so readiness is asked over
-        HTTP rather than read off the container.
+        There is no liveness endpoint, so the S3 API itself is the probe: an
+        unauthenticated GET of the service root answers once RGW is up. The
+        cluster reports HEALTH_WARN for a while after that — one OSD cannot
+        replicate — which is expected and does not stop it serving.
         """
         try:
             with urllib.request.urlopen(
-                f"{self.endpoint_url}/minio/health/live", timeout=2
+                f"{self.endpoint_url}/", timeout=2
             ) as response:
                 return response.status == 200
+        except urllib.error.HTTPError as err:
+            # 403 means RGW answered, which is all this needs to know.
+            return err.code in {403, 405}
         except (urllib.error.URLError, OSError):
             return False
 
@@ -327,7 +366,10 @@ class S3Container(_Container):
             "s3_bucket": S3_BUCKET,
             "s3_access_key": S3_USER,
             "s3_secret_key": S3_PASSWORD,
-            "s3_region": "us-east-1",
+            # RGW checks the region in a SigV4 credential scope against its
+            # zonegroup, which the demo image names "default". `auto` is a
+            # Cloudflare R2 requirement and is refused here.
+            "s3_region": "default",
             "s3_addressing_style": "path",
             "s3_signature_version": "s3v4",
         }

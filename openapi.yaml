@@ -34,6 +34,30 @@ security:
   - bearerAuth: []
 
 paths:
+  /info:
+    get:
+      summary: What this deployment expects of a client
+      description: |
+        Read once per session and cache it. One fact today: which digests to
+        compute when registering a file.
+
+        The broker signs whatever digests it is given, but only the operator
+        knows whether the store behind the endpoint verifies the SHA-256
+        checksum or ignores it. Ceph RGW ignores it — it signs the header and
+        stores whatever arrives — so a client there must also send an MD5,
+        while a client against MinIO or R2 need not. Hashing a multi-gigabyte
+        NWB file for a digest nobody checks is worth avoiding.
+      operationId: getServerInfo
+      responses:
+        "200":
+          description: Deployment facts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServerInfo"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /auth/device:
     post:
       summary: Begin GitHub device flow
@@ -130,9 +154,16 @@ paths:
         Registering a hash that already exists deduplicates: the existing
         object is reused and no upload URL is returned.
 
-        The declared `sha256` is signed into the upload URL, so the object
-        store verifies the bytes on arrival. Content cannot be registered
-        under one hash and uploaded as another.
+        A **raw** name identifies one file: registering one that already exists
+        against different content is refused with 409. Several accounts may
+        register the same raw — that is deduplication — but not disagree about
+        what it holds, because an analysis file inherits the visibility of the
+        raw it derives from, and that relationship is recorded by name.
+
+        The declared `sha256` is signed into the upload URL so the object store
+        can verify the bytes on arrival — **where the store honours it.** Ceph
+        RGW signs the header and ignores the content, so send `content_md5`
+        too: it is enforced there, and on the stores that check both.
       operationId: registerFile
       requestBody:
         required: true
@@ -152,6 +183,18 @@ paths:
         "403":
           description: |
             This tier may not upload, or a possession proof was wrong.
+        "409":
+          description: |
+            A raw file with this name is already registered against different
+            content. One raw name means one file, because analysis files
+            inherit their raw's visibility by name, and the first registration
+            of a name keeps it.
+
+            Several Spyglass instances may share one broker, and a file name is
+            unique only within an instance — so this can mean two genuinely
+            different sessions named the same. Settle that upstream by renaming
+            and registering again; the broker will not let one name mean two
+            files.
         "428":
           description: |
             The content is already stored and this identity cannot read it, so
@@ -283,6 +326,25 @@ components:
       type: string
       pattern: "^[0-9a-f]{64}$"
 
+    ServerInfo:
+      type: object
+      required: [api_version, upload_digests]
+      properties:
+        api_version:
+          type: string
+          example: v1
+        upload_digests:
+          type: array
+          description: |
+            Digests to compute and send on registration. Always contains
+            `sha256`, which is the object's address whatever the store does
+            with it. Contains `md5` as well when the store will not verify the
+            sha256 checksum — send it as `content_md5`.
+          items:
+            type: string
+            enum: [sha256, md5]
+          example: [sha256, md5]
+
     DeviceCode:
       type: object
       required: [device_code, user_code, verification_uri, interval, expires_in]
@@ -352,7 +414,40 @@ components:
           type: string
           enum: [raw, analysis]
         visibility:
-          $ref: "#/components/schemas/Visibility"
+          allOf:
+            - $ref: "#/components/schemas/Visibility"
+          description: |
+            Omit it and the broker decides:
+
+            - a **raw** file becomes public — shared storage exists to be
+              shared, and a file nobody can read is a share that did nothing;
+            - an **analysis** file takes the visibility of the raw it was
+              derived from, and *follows* it, so re-scoping a session
+              re-scopes its results. With no raw on record, public.
+
+            Send a scope and it is honoured exactly, including one **wider**
+            than the raw's — that is a choice the owner is allowed to make,
+            and it stops following the raw from then on. `PATCH
+            /file/{file_id}/visibility` does the same.
+
+            This is the rule for an omitted field, not a fallback applied on
+            error. A file whose grants were never recorded is readable by its
+            owner alone.
+        content_md5:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+          description: |
+            Hex MD5 of the same bytes. Optional, and worth sending.
+
+            The broker signs it into the upload URL as `Content-MD5`, which
+            some stores enforce even where they ignore
+            `x-amz-checksum-sha256` — Ceph RGW signs the SHA-256 checksum and
+            then does not check the bytes against it. Send both and each store
+            enforces the strongest check it supports.
+
+            MD5 is a corruption check, not a security control: collisions are
+            constructible. Where the store honours the SHA-256 checksum, that
+            stronger check still applies.
         possession_proof:
           type: string
           description: |
@@ -418,6 +513,9 @@ components:
         scope:
           type: string
           enum: [private, group, public]
+          description: |
+            `group` requires at least one team, and is refused without one —
+            a group naming nobody would silently be a private file.
         teams:
           type: array
           description: LabTeam names. Used when scope is group.

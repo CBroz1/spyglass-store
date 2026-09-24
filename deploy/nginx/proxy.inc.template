@@ -1,39 +1,12 @@
-# The body of the broker's server block, shared by the plain and TLS front
-# doors. `include`d, never loaded on its own — the rendered file is `proxy.inc`
-# rather than `proxy.conf` precisely so nginx's `conf.d/*.conf` glob skips it.
-#
-# One copy because the rate limits below are the only thing standing in front of
-# the unauthenticated login endpoints. Two copies would eventually disagree, and
-# the copy that lost would be the one someone was relying on.
-#
-# TUNING THIS FILE WITHOUT EDITING IT
-#
-# Every limit is a `${SPYGLASS_STORE_EDGE_*}` variable, set in `.env` alongside
-# the rest of the deployment's configuration. The nginx image renders
-# `/etc/nginx/templates/*.template` through envsubst at startup, so changing a
-# rate is an `.env` edit and a restart. `docker-compose.yml` gives every one of
-# them a default, and `NGINX_ENVSUBST_FILTER` there restricts substitution to
-# that prefix — so nginx's own `$binary_remote_addr` and friends are left alone.
-#
-# These are edge settings, not broker settings. The application never reads
-# them, and there is nothing in `settings.py` to match: it must not look as
-# though the broker is enforcing something it cannot. Hence the `_EDGE_`.
+# The body of the broker's server block, shared by both front doors so the
+# limits exist once. Rendered to `proxy.inc` — a name conf.d/*.conf does not
+# match — because it is included, never loaded on its own.
 
-# Registrations are small JSON. Nothing legitimate posts more than this, and
-# file bytes never come through here at all.
 client_max_body_size 64k;
 
-# WHO GETS RATE LIMITED, AND WHY THIS LINE MATTERS
-#
-# The limits key on the peer address. If another proxy you control sits in front
-# of this one — a CDN, a load balancer, a cluster ingress — then the peer is
-# *that* proxy and every user shares one bucket, so the limit either throttles
-# everybody or nobody. Naming the hop here makes nginx take the client address
-# from `X-Forwarded-For` instead.
-#
-# Name it **exactly**. The default, 127.0.0.1, trusts nothing and is a harmless
-# no-op for a directly-exposed edge. A wide range hands the choice of bucket
-# back to the caller: anyone can prepend a fake address and get a fresh one.
+# The address of a proxy in front of this one, if there is one, so the limits
+# key on the real caller. The default trusts nothing; a wide range lets a caller
+# pick their own bucket by forging the header. See deploy/README.md.
 set_real_ip_from ${SPYGLASS_STORE_EDGE_TRUSTED_PROXY};
 real_ip_header X-Forwarded-For;
 real_ip_recursive on;
@@ -43,23 +16,19 @@ proxy_set_header X-Real-IP $remote_addr;
 proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 proxy_set_header X-Forwarded-Proto $scheme;
 
-# DO NOT TURN THIS ON. `GET /file/{id}/content` answers 302 to a presigned URL
-# on the object store, a different origin by design. Rewriting that Location to
-# this server's origin would make clients keep their `Authorization` header
-# across the redirect, and the store answers those with a complaint about a
-# missing `x-amz-content-sha256` that reads nothing like an auth error. See
-# deploy/README.md.
+# DO NOT TURN THIS ON. The content route answers 302 to a presigned URL on the
+# object store, a different origin by design. Rewriting that Location to this
+# origin makes clients keep `Authorization` across the redirect, and the store
+# then refuses every read. See deploy/README.md.
 proxy_redirect off;
 
-# For the same reason there is no location for the object store here. It is
-# published at its own hostname, not a path under this one.
-
+# HSTS is set per location, not once per server: nginx does not inherit
+# `add_header` into a location that sets its own, and the two below set
+# `Retry-After`. Dropping these lines silently un-protects those endpoints.
 location = /api/v1/auth/device {
     limit_req zone=auth_start burst=${SPYGLASS_STORE_EDGE_DEVICE_BURST} nodelay;
     limit_req zone=auth_total burst=${SPYGLASS_STORE_EDGE_TOTAL_BURST} nodelay;
-    # `always`, so it is sent on the 429 as well as on a success.
     add_header Retry-After ${SPYGLASS_STORE_EDGE_RETRY_AFTER} always;
-    # Repeated in every location on purpose; see the map in limits.conf.
     add_header Strict-Transport-Security $hsts_header always;
     proxy_pass http://broker;
 }
@@ -72,11 +41,9 @@ location = /api/v1/auth/token {
     proxy_pass http://broker;
 }
 
-# Everything else is deliberately unlimited here. Those routes need a bearer
-# token, and what they cost is metered per account by the broker's own volume
-# quota. A request-rate limit on top would throttle the workload this service
-# exists for: a streamed read re-follows the content redirect once per range
-# request, which looks exactly like a flood and is not one.
+# Everything else is unlimited on purpose: those routes need a bearer token and
+# are metered per account by the broker's quota. A streamed read re-follows the
+# content redirect once per range request, which looks exactly like a flood.
 location / {
     add_header Strict-Transport-Security $hsts_header always;
     proxy_pass http://broker;

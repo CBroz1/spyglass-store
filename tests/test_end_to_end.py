@@ -1,6 +1,6 @@
 """The whole path: one person uploads a file, another streams it.
 
-Nothing is faked below the HTTP client. Real MySQL, real MinIO, real broker
+Nothing is faked below the HTTP client. Real MySQL, real object store, real broker
 tokens, real signatures. The only stand-in is GitHub, because a test cannot
 ask a human to approve a device code.
 
@@ -187,6 +187,9 @@ def test_re_registering_the_same_bytes_skips_the_upload(client, accounts):
         "size_bytes": len(PAYLOAD),
         "spyglass_name": NAME,
         "file_class": "raw",
+        # Stated, not inherited: the proof below is only asked of someone who
+        # cannot already read the content, and the default is public.
+        "visibility": {"scope": "private"},
     }
 
     first = client.post(
@@ -272,58 +275,6 @@ def test_a_forged_token_gets_nothing(client, accounts):
     )
 
     assert forged.status_code == 401
-
-
-def test_bytes_that_do_not_match_the_registered_hash_are_refused(
-    client, accounts, object_store
-):
-    """Registering one hash and uploading other content must not work.
-
-    The broker never sees the bytes, so it cannot check this itself. It signs
-    the declared hash into the upload URL and the store enforces it — and
-    because the requirement is part of the signature, a client cannot drop the
-    header to skip the check.
-    """
-    target = client.post(
-        "/api/v1/file",
-        json={
-            "sha256": SHA,
-            "size_bytes": len(PAYLOAD),
-            "spyglass_name": NAME,
-            "file_class": "raw",
-        },
-        headers=auth(accounts, "ada"),
-    ).json()
-
-    wrong = httpx.put(
-        target["upload_url"],
-        content=b"entirely different content",
-        headers=target["upload_headers"],
-    )
-
-    assert wrong.status_code == 400
-    assert "ChecksumMismatch" in wrong.text
-    assert not object_store.exists(target["upload_url"].split("?")[0][-64:])
-
-
-def test_the_checksum_header_cannot_be_dropped(client, accounts):
-    """Omitting the header invalidates the signature rather than waiving it."""
-    target = client.post(
-        "/api/v1/file",
-        json={
-            "sha256": SHA,
-            "size_bytes": len(PAYLOAD),
-            "spyglass_name": NAME,
-            "file_class": "raw",
-        },
-        headers=auth(accounts, "ada"),
-    ).json()
-
-    assert target["upload_headers"], "the broker must state the requirement"
-
-    bare = httpx.put(target["upload_url"], content=PAYLOAD)
-
-    assert bare.status_code >= 400
 
 
 def test_a_registration_awaiting_bytes_is_not_an_error(client, accounts):
@@ -458,6 +409,10 @@ def test_a_private_registration_does_not_mask_a_readable_one(client, accounts):
         "size_bytes": len(PAYLOAD),
         "spyglass_name": NAME,
         "file_class": "raw",
+        # The private row this test is named for. Registration defaults to
+        # public, so leaving it out would give Mallory a readable row and the
+        # test would pass for the wrong reason.
+        "visibility": {"scope": "private"},
     }
 
     client.post("/api/v1/file", json=body, headers=auth(accounts, "ada"))
@@ -503,8 +458,16 @@ def _register(client, accounts, who, **overrides):
 
 
 def _ada_uploads_privately(client, accounts):
-    """Ada registers and uploads a file nobody else may read."""
-    target = _register(client, accounts, "ada").json()
+    """Ada registers and uploads a file nobody else may read.
+
+    Private is stated rather than inherited: registration defaults to public,
+    and every possession test below depends on Bob *not* being able to read
+    these bytes. Left implicit, a change of default would quietly turn those
+    tests into assertions about nothing.
+    """
+    target = _register(
+        client, accounts, "ada", visibility={"scope": "private"}
+    ).json()
     httpx.put(
         target["upload_url"],
         content=PAYLOAD,

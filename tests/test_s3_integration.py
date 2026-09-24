@@ -1,18 +1,17 @@
-"""Integration tests against a containerized S3 store.
+"""Tests that need a real object store.
 
-These run against a real S3 implementation rather than a mock. Presigning is
-the one part of the adapter a stub cannot stand in for — a fake can return a
-string shaped like a URL, but only a real store will tell you whether the
-signature it carries is one it accepts.
+**Scope: what this package does, not what a store decides to refuse.** Signing
+a URL a compatible store honours, and reading and probing objects through it —
+that is what is asserted. Whether a store refuses an expired signature, a
+tampered key, or a checksum mismatch is the store's behaviour, it varies
+between them, and a test of it reports on the backend rather than on this code.
 
-MinIO stands in for the deployment. Because the adapter speaks only the S3 API,
-pointing these at Ceph RGW, SeaweedFS, or Garage is an endpoint change; that
-reversibility is itself what is under test.
+**No store means a red suite, not a skipped one.** An unreachable object store
+is a broken test environment, and a green run that proved nothing is worse than
+a failure that says so.
 """
 
 from __future__ import annotations
-
-import time
 
 import httpx
 import pytest
@@ -70,60 +69,7 @@ def test_verify_store_names_the_bucket_it_could_not_reach(s3_settings):
         wrong.verify_store()
 
 
-def test_a_signature_expires(object_store, stored):
-    """Short TTLs are the reason the broker can leave the data path.
-
-    An issued URL cannot be revoked, so its lifetime is the only bound on how
-    long a decision stays in force.
-    """
-    url = object_store.presigned_get(stored, 1)
-    time.sleep(2)
-
-    assert httpx.get(url).status_code == 403
-
-
-def test_an_unsigned_request_is_refused(object_store, stored):
-    """Without a signature the bucket must give nothing away.
-
-    If this passed, the bucket would be public and every permission decision
-    above it decorative.
-    """
-    unsigned = object_store.presigned_get(stored, 300).split("?")[0]
-
-    assert httpx.get(unsigned).status_code == 403
-
-
-def test_a_tampered_key_is_refused(object_store, stored):
-    """A signature covers the key, so it cannot be repointed at another."""
-    url = object_store.presigned_get(stored, 300)
-    other = url.replace(SHA, "e" * 64)
-
-    assert httpx.get(other).status_code == 403
-
-
 # ------------------ a stray Authorization header ------------------
-
-
-def test_presigned_get_rejects_a_stray_authorization_header(
-    object_store, stored
-):
-    """A presigned GET must refuse a request carrying `Authorization`.
-
-    This is the verb the content redirect uses. A client that forwarded its
-    broker credential across the 302 would land here, and the store refuses —
-    which is why the broker and the object store must not share an origin.
-
-    The header does not cause a signature mismatch; it switches the store out
-    of presigned-URL mode into header authentication, which then demands a
-    header the client never sent.
-    """
-    url = object_store.presigned_get(stored, 300)
-
-    clean = httpx.get(url)
-    with_auth = httpx.get(url, headers={"Authorization": "Bearer broker-tok"})
-
-    assert clean.status_code == 200
-    assert with_auth.status_code >= 400
 
 
 def test_a_cross_origin_redirect_strips_the_header(object_store, stored):

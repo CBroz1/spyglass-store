@@ -38,6 +38,32 @@ from spyglass_store.access import AccessRule, Principal
 from spyglass_store.auth import Identity
 from spyglass_store.db import db_now, serialized, window_start
 from spyglass_store.lab import teams_for_github
+from spyglass_store.nwbfile import parent_for
+
+
+class ContentConflict(Exception):
+    """A raw name was registered against content that contradicts it.
+
+    One raw name means one file. Several people may register it — that is
+    deduplication, and they each get a registration — but they must be
+    registering the *same bytes*.
+
+    This is load-bearing, not tidiness. An analysis file inherits the
+    visibility of the raw it derives from, and the edge Spyglass records is a
+    *name*. If two registrations of one name could hold different content, then
+    anyone able to register a name could plant a public registration of someone
+    else's raw and inherit read access to every derivative of it. Requiring the
+    content to agree means every registration of a raw name was made by someone
+    who provably held that raw, so "the raw's visibility" is a question with one
+    answer.
+
+    **Several Spyglass instances may share one broker**, and `nwb_file_name` is
+    unique only within an instance — so two instances can genuinely hold
+    different sessions under one name. That is a naming disagreement between
+    people, and it is settled upstream by renaming, not here by letting a name
+    mean two things. The refusal says so; first registration of a name keeps
+    it.
+    """
 
 
 @dataclass(frozen=True)
@@ -58,6 +84,16 @@ class FileRecord:
         Either raw or analysis.
     owner : str
         Account id that registered it.
+    parent : str or None
+        For an analysis file, the `spyglass_name` of the raw it was derived
+        from, as recorded in Spyglass's `AnalysisNwbfile`. None for a raw file,
+        and for an analysis file Spyglass has no row for.
+
+        Last, and defaulted, because `FileRecord` is constructed positionally
+        in places this package does not own.
+    inherits : bool
+        True when this file takes its audience from `parent` and follows it.
+        False when a visibility was declared for this file specifically.
     """
 
     file_id: str
@@ -66,15 +102,14 @@ class FileRecord:
     spyglass_name: str
     file_class: str
     owner: str
+    parent: str | None = None
+    inherits: bool = False
 
 
 def _schema():
     """Return the broker's tables, declared on first use.
 
-    A single accessor rather than one per table. Three separately cached
-    lookups meant three caches to reset when the configuration changed, and a
-    fixture that cleared some of them left the rest pointing at the old
-    connection.
+    One accessor, so one cache to reset when the configuration changes.
     """
     from spyglass_store import schema
 
@@ -107,6 +142,8 @@ def _record(row: dict | None) -> FileRecord | None:
         spyglass_name=row["spyglass_name"],
         file_class=row["file_class"],
         owner=str(row["owner"]),
+        parent=row.get("parent"),
+        inherits=bool(row.get("inherits", False)),
     )
 
 
@@ -191,6 +228,27 @@ def files_by_sha256(sha256: str) -> tuple[FileRecord, ...]:
 
 
 @serialized
+def registrations_of_parent(parent: str) -> tuple[FileRecord, ...]:
+    """Return every registration of the raw an analysis file derives from.
+
+    Named separately from `files_by_name` because the question is different:
+    this one is asked on the read path, about a name the *broker* recorded from
+    Spyglass rather than a name a caller supplied. Every row it returns holds
+    the same content, enforced at registration — see `ContentConflict`.
+
+    Parameters
+    ----------
+    parent : str
+        A raw file's `spyglass_name`, as recorded on `File.parent`.
+
+    Returns
+    -------
+    tuple of FileRecord
+    """
+    return files_by_name(parent)
+
+
+@serialized
 def rules_for_file(file_id: str) -> tuple[AccessRule, ...]:
     """Return every grant recorded against a file.
 
@@ -261,6 +319,7 @@ def register_file(
     file_class: str,
     owner: str,
     rules: Iterable[AccessRule] = (),
+    inherit_if_parent: bool = False,
 ) -> FileRecord:
     """Record a file and the grants its declared visibility implies.
 
@@ -283,15 +342,65 @@ def register_file(
     owner : str
         Account id registering the file.
     rules : iterable of AccessRule, optional
-        Grants to record. Empty for a private file.
+        Grants to record. Empty for a private file. Ignored when this file
+        ends up inheriting.
+    inherit_if_parent : bool, optional
+        Set when the registration declared no visibility of its own. An
+        analysis file whose raw is known then takes that raw's audience and
+        follows it, rather than being given grants of its own — which is what
+        makes re-scoping a session re-scope its results.
+
+        Without a known parent there is nothing to inherit, so `rules` apply
+        as given; the caller's default for an undeclared file is public.
 
     Returns
     -------
     FileRecord
-        The newly registered file, with its generated `file_id`.
+        The newly registered file, with its generated `file_id`, and for an
+        analysis file the raw it was derived from.
     """
     _, File, FileAccess = tables()
     file_id = uuid4().hex
+
+    # One raw name, one content. See `ContentConflict`; this is what makes
+    # inherited visibility safe rather than a way to publish someone else's
+    # derivatives. Analysis names are deliberately not held to it — a
+    # regenerated analysis file reusing its name is expected, and nothing
+    # inherits from an analysis file.
+    if file_class == "raw":
+        disagreeing = [
+            other
+            for other in files_by_name(spyglass_name)
+            if other.sha256 != sha256
+        ]
+        if disagreeing:
+            raise ContentConflict(
+                f"{spyglass_name!r} is already registered against different "
+                f"content ({disagreeing[0].sha256[:12]}...). A raw file name "
+                "identifies one file here, and the first registration of a "
+                "name keeps it.\n"
+                "If this is genuinely a different session that happens to "
+                "share a name with one on another instance, that is a naming "
+                "disagreement to settle upstream: rename it in Spyglass and "
+                "register it again. If it is the same session, the bytes "
+                "changed, and that is worth understanding before overwriting "
+                "anything."
+            )
+
+    # Read from Spyglass, not from the request: the caller does not get to say
+    # what their file was derived from. Resolved here rather than in the route
+    # so the lookup happens wherever a file is registered, and recorded once
+    # rather than re-derived per read — `AnalysisNwbfile` is user-writable, so a
+    # live lookup would let someone re-point an existing registration's
+    # provenance. See `nwbfile.py`.
+    parent = parent_for(spyglass_name, file_class)
+
+    # Declaring nothing is a request to follow the raw, not a request for
+    # privacy — but only where there is a raw to follow.
+    inherits = bool(inherit_if_parent and parent)
+
+    if inherits:
+        rules = ()
 
     with dj.conn().transaction:
         File.insert1(
@@ -301,6 +410,8 @@ def register_file(
                 "size_bytes": size_bytes,
                 "spyglass_name": spyglass_name,
                 "file_class": file_class,
+                "parent": parent,
+                "inherits": inherits,
                 "owner": int(owner),
             }
         )
@@ -322,6 +433,8 @@ def register_file(
         spyglass_name=spyglass_name,
         file_class=file_class,
         owner=str(owner),
+        parent=parent,
+        inherits=inherits,
     )
 
 
@@ -716,10 +829,9 @@ def usage_since(
     a resolve hands out a name rather than bytes, and an upload is charged
     against a different allowance than a download.
 
-    **MySQL does the folding.** The log grows with requests, not with files, so
-    reading it row by row to sum in Python made a cheap check scale with how
-    hard the account had been hammering the service. What comes back now is one
-    row per distinct file, which is quota's own unit; see `_USAGE_SQL`.
+    **MySQL does the folding**, because the log grows with requests while the
+    answer does not. What comes back is one row per distinct file, which is
+    quota's own unit; see `_USAGE_SQL`.
 
     The window is measured against the database's clock rather than the
     broker host's. `datetime.now()` is naive and local; MySQL stores these
@@ -837,8 +949,14 @@ def replace_rules(file_id: str, rules: Iterable[AccessRule]) -> None:
         File whose visibility is changing.
     rules : iterable of AccessRule
         Grants the new visibility implies. Empty makes the file private.
+
+    Notes
+    -----
+    Also clears `File.inherits`: a file whose visibility has been set follows
+    its own grants from then on, whether they are wider or narrower than the
+    raw's.
     """
-    _, _, FileAccess = tables()
+    _, File, FileAccess = tables()
     new = [
         {
             "file_id": file_id,
@@ -851,3 +969,7 @@ def replace_rules(file_id: str, rules: Iterable[AccessRule]) -> None:
     with dj.conn().transaction:
         (FileAccess & {"file_id": file_id}).delete_quick()
         FileAccess.insert(new)
+        # Setting a visibility is a choice, and a choice stops following the
+        # raw. Otherwise narrowing a derivative would appear to work and then
+        # be undone by the next read, which consults the parent.
+        File.update1({"file_id": file_id, "inherits": 0})

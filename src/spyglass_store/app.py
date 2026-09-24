@@ -23,26 +23,12 @@ The broker never serves bytes. It decides, signs, and redirects, which is why
 `presigned_ttl_seconds` is short: once a URL is issued the broker is out of the
 data path and cannot revoke it.
 
-**The redirect target must be a different origin than the broker.** Every
-client tested strips `Authorization` when a redirect crosses origins and
-forwards it when it does not, and an S3 store that receives one switches out
-of presigned-URL mode and rejects the request with a complaint about
-`x-amz-content-sha256` rather than anything mentioning signatures. Serving the
-broker and the object store under one hostname therefore breaks reads, which
-is a natural thing for a reverse proxy to do by accident.
-
-**Rate limiting the unauthenticated `/auth` endpoints is the edge's job**, not
-this module's. They proxy to GitHub on the broker's own client id, so an
-unthrottled caller can exhaust the app's GitHub rate limit and deny logins to
-everyone. Doing it here would mean trusting `X-Forwarded-For` to tell one
-caller from another, which behind a proxy requires a trusted-hop count the
-broker does not have — `client_ip` is deliberately audit-only. The limits live
-in `deploy/nginx/`, tunable from the deployment's `.env`, and there is nothing
-in `settings.py` to match them on purpose.
-
-Transport security is the edge's job for the same reason: this application is
-served over plain HTTP inside the deployment, and what keeps a bearer token off
-the wire is TLS terminated in front of it. See `deploy/README.md`.
+Three things this module deliberately does not do, because the edge in front
+of it does them — rate limit the unauthenticated `/auth` endpoints, terminate
+TLS, and keep the object store on a different hostname. `client_ip` is
+audit-only for the first of those: behind a proxy, telling callers apart by
+address means trusting `X-Forwarded-For` without a trusted-hop count. See
+`deploy/README.md`.
 """
 
 from __future__ import annotations
@@ -57,7 +43,7 @@ from spyglass_store import registry
 from spyglass_store.access import Scope, may_upload, rules_for
 from spyglass_store.auth import Identity, TokenVerifier, require_identity
 from spyglass_store.deployment import (
-    same_origin,  # noqa: F401 - re-exported; it moved, its importers did not
+    same_origin,  # noqa: F401 - re-exported for callers that import it here
     verify_deployment,
 )
 from spyglass_store.github import (
@@ -67,7 +53,7 @@ from spyglass_store.github import (
 )
 from spyglass_store.guards import (
     _authorize,
-    _charged_size,  # noqa: F401 - re-exported; it moved, importers did not
+    _charged_size,  # noqa: F401 - re-exported for callers that import it here
     _enforce_quota,
     _pick_readable,
     _require_possession,
@@ -78,6 +64,7 @@ from spyglass_store.models import (
     DeviceCodeOut,
     FileOut,
     FileRegistrationIn,
+    ServerInfo,
     TokenOut,
     TokenRequest,
     UploadTarget,
@@ -108,9 +95,7 @@ def create_app(
     github : optional
         GitHub device-flow client. Defaults to one built from settings.
     registry_module : optional
-        Database access layer. Defaults to `spyglass_store.registry`. The one
-        dependency that used to be reached as a module global, which meant a
-        test had to patch it function by function rather than supply it once.
+        Database access layer. Defaults to `spyglass_store.registry`.
     store : optional
         Object store adapter. Defaults to `S3ObjectStore`. Injected by tests,
         which must not need a live bucket to check a permission decision.
@@ -149,6 +134,36 @@ def create_app(
         this a poor place to re-probe them on every poll.
         """
         return {"status": "ok"}
+
+    @app.get(f"{API_PREFIX}/info", response_model=ServerInfo)
+    def server_info(
+        identity: Annotated[Identity, Depends(require_identity)],
+    ) -> ServerInfo:
+        """What this deployment expects of a client.
+
+        One fact today: which digests to send when registering a file. The
+        broker signs whatever it is given, but only the operator knows whether
+        the store behind the endpoint verifies the SHA-256 checksum or ignores
+        it — Ceph RGW ignores it — so the client would otherwise have to
+        compute an MD5 on every multi-gigabyte upload on the chance that it
+        matters.
+
+        Authenticated, like everything but login: it describes the deployment,
+        and an unauthenticated caller has no file to upload.
+
+        Cacheable for the life of a session. It changes when an operator
+        changes backends, which is not something that happens mid-upload.
+        """
+        digests = ["sha256"]
+
+        if not settings.s3_store_verifies_sha256:
+            # The store will not check the address digest, so send the one it
+            # will check. See `settings.s3_store_verifies_sha256`.
+            digests.append("md5")
+
+        return ServerInfo(
+            api_version=API_PREFIX.rsplit("/", 1)[-1], upload_digests=digests
+        )
 
     @app.post(f"{API_PREFIX}/auth/device", response_model=DeviceCodeOut)
     def begin_device_flow() -> DeviceCodeOut:
@@ -309,10 +324,13 @@ def create_app(
                 detail="This identity may not upload.",
             )
 
+        # No visibility declared means "decide for me": public for a raw file,
+        # and the raw's own audience for an analysis file that has one. A
+        # declared visibility is honoured as given, wider or narrower.
+        declared = body.visibility or VisibilityIn(scope="public")
+
         try:
-            rules = rules_for(
-                Scope(body.visibility.scope), body.visibility.teams
-            )
+            rules = rules_for(Scope(declared.scope), declared.teams)
         except ValueError as err:  # group with no teams names nobody
             raise HTTPException(status_code=422, detail=str(err)) from err
 
@@ -342,14 +360,25 @@ def create_app(
             body.sha256, body.spyglass_name, identity.account_id
         )
 
-        file = existing or app.state.registry.register_file(
-            sha256=body.sha256,
-            size_bytes=body.size_bytes,
-            spyglass_name=body.spyglass_name,
-            file_class=body.file_class,
-            owner=identity.account_id,
-            rules=rules,
-        )
+        try:
+            file = existing or app.state.registry.register_file(
+                sha256=body.sha256,
+                size_bytes=body.size_bytes,
+                spyglass_name=body.spyglass_name,
+                file_class=body.file_class,
+                owner=identity.account_id,
+                rules=rules,
+                inherit_if_parent=body.visibility is None,
+            )
+        except registry.ContentConflict as err:
+            # One raw name, one file. Refused rather than accepted because an
+            # analysis file inherits its raw's visibility *by name*, so a second
+            # raw registration holding different bytes would be a way to
+            # publish someone else's derivatives. 409 rather than 422: the
+            # request is well-formed and would have been fine yesterday.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail=str(err)
+            ) from err
 
         # Content addressing means the object may already be present from
         # someone else's upload. That is the deduplication: the registration is
@@ -375,6 +404,7 @@ def create_app(
             key,
             settings.presigned_ttl_seconds,
             sha256=body.sha256,
+            content_md5=body.content_md5,
         )
 
         return UploadTarget(
@@ -407,6 +437,30 @@ def create_app(
             # such file": the declaration is real and the upload may still be
             # running. Uploads are expected to be slow, so this is a normal
             # transient state rather than something to clean up.
+            #
+            # Logged as a refused read, for two reasons. It is the only record
+            # that anyone *wanted* this file — `reconcile` can say which
+            # registrations have no bytes, but not which of those someone is
+            # waiting for, and that is what tells an operator what to upload
+            # first. And without a row, an authenticated caller holding a
+            # file_id could probe whether an object exists and leave no trace.
+            #
+            # Charges nothing: no URL was issued and nothing was transferred.
+            #
+            # This runs before `_authorize`, so the row is written for a caller
+            # whose permission has not been checked. That ordering is older
+            # than this log and is deliberate — see the note below on why the
+            # quota check precedes authorization — but it does mean existence
+            # is disclosed to anyone with a valid token and a file_id. The id
+            # is a 128-bit random, so guessing one is not the concern; the
+            # untraced probe was, and this closes it.
+            app.state.registry.log_access(
+                identity=identity,
+                action="read",
+                granted=False,
+                file_id=file_id,
+                source_ip=client_ip(request),
+            )
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Registered, but the upload has not completed.",

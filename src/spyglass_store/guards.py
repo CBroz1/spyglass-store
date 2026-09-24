@@ -44,6 +44,52 @@ def client_ip(request: Request) -> str:
     return request.client.host if request.client else ""
 
 
+def _readable(request: Request, file: registry.FileRecord, identity: Identity):
+    """Return True if `identity` may read `file`, directly or by inheritance.
+
+    **An analysis file that declared no visibility is readable by whoever may
+    read the raw it came from**, and follows that raw as it changes. That is the
+    point of recording `File.parent`: a derivative produced on a shared compute
+    host is registered by that host's account, so without inheritance the person
+    whose raw it came from — the one who has every reason to read it — would be
+    locked out of a private result, while the compute account that happened to
+    upload it would not.
+
+    **A declared visibility is honoured exactly**, wider or narrower than the
+    raw, because that was somebody's choice. `File.inherits` is what separates
+    the two cases, and `replace_rules` clears it: a file whose visibility has
+    been set does not quietly go back to following its parent.
+
+    One hop, always. Spyglass's `AnalysisNwbfile` points at `Nwbfile`, so a
+    parent is always a raw file and a raw file never has one — there is no chain
+    to walk and no cycle to guard against.
+
+    The parent is a name, and every registration of a raw name holds the same
+    content (`registry.ContentConflict`), so "may read the raw" is the union
+    over those registrations rather than a choice between rival rows. Without
+    that rule this would be a way to read other people's derivatives: register
+    the raw's name against bytes of your own, declare it public, inherit.
+
+    Costs an extra query, and only when the direct check has already failed and
+    the file has a parent.
+    """
+    reg = request.app.state.registry
+    reader = identity.as_reader()
+
+    if may_read(reg.rules_for_file(file.file_id), reader, file.owner):
+        return True
+
+    parent = getattr(file, "parent", None)
+
+    if not (parent and getattr(file, "inherits", False)):
+        return False
+
+    return any(
+        may_read(reg.rules_for_file(raw.file_id), reader, raw.owner)
+        for raw in reg.registrations_of_parent(parent)
+    )
+
+
 def _pick_readable(
     request: Request,
     candidates: list[registry.FileRecord],
@@ -63,8 +109,7 @@ def _pick_readable(
     readable = []
 
     for file in candidates:
-        rules = request.app.state.registry.rules_for_file(file.file_id)
-        if not may_read(rules, identity.as_reader(), file.owner):
+        if not _readable(request, file, identity):
             continue
         if file.owner == identity.account_id and identity.account_id:
             return file
@@ -102,8 +147,7 @@ def _authorize(
         403 when the caller may not read the file.
     """
     reg = request.app.state.registry
-    rules = reg.rules_for_file(file.file_id)
-    permitted = may_read(rules, identity.as_reader(), file.owner)
+    permitted = _readable(request, file, identity)
 
     reg.log_access(
         identity=identity,

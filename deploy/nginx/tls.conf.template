@@ -1,41 +1,16 @@
-# TLS termination at the edge. Mounted only by `docker-compose.tls.yml`, which
-# also publishes 80 and 443 and mounts the certificate directory read-only.
-#
-# WHY THIS IS NOT OPTIONAL IN A REAL DEPLOYMENT
-#
-# A broker token is a bearer credential sent in a header on every request, and a
-# presigned URL carries its signature in the query string. Over plain HTTP both
-# are readable by anything on the path, and the presign is replayable until it
-# expires. Either this file or a TLS terminator in front of it is required; there
-# is no third option that is safe.
-#
-# CERTIFICATES
-#
-# Supply your own. Paths are container paths, so they must fall inside whatever
-# `docker-compose.tls.yml` mounts, and nginx must be able to read the key. There
-# is deliberately no ACME client here: an institutional certificate is the common
-# case, and a service that renews its own certificate needs outbound reachability
-# and a writable volume that this container otherwise does without.
-#
-# Reloading after a renewal is `docker compose ... exec edge nginx -s reload`.
-# nginx reads certificates once at startup, so a renewed file on disk changes
-# nothing until it does.
+# TLS termination, mounted only by docker-compose.tls.yml. Certificates and
+# setup: deploy/README.md.
 
 server {
-    # `default_server`, so this catches requests for any hostname rather than
-    # only the configured one. Without it the image's own stock server block
-    # answers port 80 for everything else — a welcome page where a redirect to
-    # HTTPS belongs.
+    # `default_server`, or the image's own stock server answers port 80 for
+    # every hostname but this one.
     listen 80 default_server;
     listen [::]:80 default_server;
     server_name ${SPYGLASS_STORE_EDGE_SERVER_NAME};
 
-    # 308, not 301: it preserves the method and body, and both `/auth` routes
-    # are POSTs. A 301 would turn a client's POST into a GET and the failure
-    # would look like a broken endpoint rather than a redirect.
-    #
-    # If you add an ACME client later, its `/.well-known/acme-challenge/` path
-    # needs an exception above this.
+    # 308 keeps the method: both login endpoints are POSTs, and a 301 would
+    # turn them into GETs. An ACME client, if one is ever added, needs an
+    # exception above this.
     return 308 https://$host$request_uri;
 }
 
@@ -45,21 +20,15 @@ server {
     http2 on;
     server_name ${SPYGLASS_STORE_EDGE_SERVER_NAME};
 
+    # nginx reads these once, at startup: reload after a renewal.
     ssl_certificate     ${SPYGLASS_STORE_EDGE_TLS_CERT};
     ssl_certificate_key ${SPYGLASS_STORE_EDGE_TLS_KEY};
 
-    # TLS 1.2 is the floor because some institutional clients are old. Cipher
-    # order is left to the client, which is the current recommendation for
-    # 1.2-and-above: modern clients pick better than a hardcoded list ages.
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_prefer_server_ciphers off;
     ssl_session_cache shared:SSL:10m;
     ssl_session_timeout 1d;
     ssl_session_tickets off;
 
-    # HSTS is set per location, in `proxy.inc`, because nginx would not inherit
-    # it into the two locations that set their own `Retry-After` — see the map
-    # in `limits.conf`. It applies to this hostname only; the object store is a
-    # different origin and sets its own policy.
     include /etc/nginx/conf.d/proxy.inc;
 }

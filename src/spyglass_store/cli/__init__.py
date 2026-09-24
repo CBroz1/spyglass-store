@@ -183,6 +183,8 @@ def _file_show(args) -> int:
     print(f"name         {file.spyglass_name}")
     print(f"class        {file.file_class}")
     print(f"sha256       {file.sha256}")
+    if file.parent:
+        print(f"derived from {file.parent}")
     print(f"size         {file.size_bytes / 1024**2:.1f} MB (declared)")
     print(f"owner        account {file.owner}")
     print(f"uploaded     {'yes' if present else 'no — bytes not in the store'}")

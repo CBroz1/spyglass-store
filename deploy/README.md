@@ -77,10 +77,10 @@ The example is named `env.example` rather than `.env.example` because
 already has a DataJoint configuration: the container cannot read your
 `~/.datajoint_config.json`.
 
-Four services: the object store, a one-shot job that creates the bucket, the
-broker, and an nginx edge that publishes it. The broker waits for the bucket to
-exist, because it verifies storage at startup and will otherwise refuse to
-boot, and the edge waits for the broker to report healthy — nginx resolves its
+Three services: a Ceph RGW object store, the broker, and an nginx edge that
+publishes it. The store creates its own bucket, which is why no separate job
+does — the broker verifies storage at startup and will otherwise refuse to boot.
+The edge waits for the broker to report healthy — nginx resolves its
 upstream when it loads its configuration, so an edge that starts first answers
 502 until something restarts it.
 
@@ -90,9 +90,10 @@ it is where the login endpoints are rate limited — see below.
 **The edge serves plain HTTP as configured.** That is correct only where TLS is
 terminated in front of it; otherwise add the TLS overlay, described below.
 
-The broker does not create the bucket itself. Provisioning storage is an
-operator action; a web service holding the only write credential should not
-also be able to make new places to write.
+The broker still does not create the bucket itself. Provisioning storage is an
+operator action; a web service holding the only write credential should not also
+be able to make new places to write. Against a real cluster you create the
+bucket and hand the broker a scoped key.
 
 Database configuration is DataJoint's own `DJ_HOST`, `DJ_USER`, `DJ_PASS`
 rather than broker settings, so an admin who can already reach the ServerHost
@@ -100,10 +101,9 @@ instance needs nothing new.
 
 ### Surviving a reboot
 
-The three long-running services are `restart: unless-stopped`, so a broker that
-dies on a transient fault comes back on its own. The bucket-creation job is
-`restart: "no"` — it exits 0 by design, and restarting it forever would leave
-`docker compose ps` looking permanently unhealthy.
+All three services are `restart: unless-stopped`, so a broker that dies on a
+transient fault comes back on its own. There is no one-shot job to exempt: the
+store image creates its own bucket.
 
 **A restart policy does nothing if the Docker daemon itself does not start at
 boot.** On a host that has never had it enabled, every container stays down
@@ -317,6 +317,16 @@ before it arrived.
 Grant these tables `SELECT` to ordinary users and reserve `INSERT`, `UPDATE`,
 and `DELETE` for admins.
 
+The broker also reads `common_nwbfile.Nwbfile` and
+`common_nwbfile.AnalysisNwbfile`, to learn which raw file an analysis file was
+derived from. Those are **not** trust roots in the same way and must not be
+locked down: writing an analysis file is what an ordinary pipeline run does. The
+broker accounts for that by reading the relationship once, when a file is
+registered, and never re-deriving it — so someone who later re-points a
+provenance row cannot change a decision the broker has already recorded. Both
+need `SELECT` for the broker's account, and startup fails naming the column if
+either is missing one.
+
 The broker cannot verify this for you. A privilege is a property of the
 database, not of the rows it reads, so there is nothing for `verify_lab_schema`
 to check — it confirms the columns exist, not who may write them. If your
@@ -358,10 +368,28 @@ SHA-256 into the upload URL as a required `x-amz-checksum-sha256`, and the
 store verifies on arrival. Because the requirement is part of the signature, a
 client that omits the header gets a refusal rather than an unverified upload.
 
-Verified working on MinIO and Cloudflare R2. If a backend rejects the header,
-set `SPYGLASS_STORE_S3_ENFORCE_UPLOAD_CHECKSUM=false` — and understand what
-that costs: content can then be registered under one hash and uploaded as
-another, with nothing downstream able to detect it.
+The broker signs **both** `x-amz-checksum-sha256` and, when the client supplies
+`content_md5`, `Content-MD5`. Stores disagree about which they honour:
+
+| Store | `x-amz-checksum-sha256` | `Content-MD5` |
+| --- | --- | --- |
+| MinIO | enforced | enforced |
+| Cloudflare R2 | enforced | enforced |
+| **Ceph RGW (Squid 19.2.0)** | **signed and ignored** | enforced |
+
+That middle cell is the one to read twice. RGW covers the header with the
+signature — dropping it gives a 403 — and then stores whatever bytes arrive. A
+mismatched upload was accepted and kept in testing. So on Ceph, upload integrity
+rests on `Content-MD5`, which catches corruption but not a deliberate
+substitution, because MD5 collisions are constructible.
+
+**A client that omits `content_md5` therefore gets no integrity check at all on
+Ceph.** Sending it is not optional in practice.
+
+If a backend rejects both, set
+`SPYGLASS_STORE_S3_ENFORCE_UPLOAD_CHECKSUM=false` — and understand what that
+costs: content can then be registered under one hash and uploaded as another,
+with nothing downstream able to detect it.
 
 ## Quota
 

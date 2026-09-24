@@ -97,7 +97,26 @@ def get_schema() -> SimpleNamespace:
 
     @schema
     class File(dj.Manual):
-        """A registered object, addressed by content hash."""
+        """A registered object, addressed by content hash.
+
+        `parent` records the raw file an analysis file was derived from, read
+        from Spyglass's `AnalysisNwbfile` when the file is registered. It is a
+        `spyglass_name` rather than a `file_id` because a name may carry
+        several registrations — different owners declaring the same file — and
+        the useful question is which of *those* a reader is party to, not which
+        one row was picked at registration.
+
+        Recorded once and not re-derived: `AnalysisNwbfile` is user-writable,
+        so a live lookup would let someone re-point the provenance of an
+        existing registration. See `nwbfile.py`.
+
+        `inherits` says whether this file's audience is its own or its raw's.
+        A registration that declared no visibility takes the raw's and follows
+        it, so re-scoping a session re-scopes its results. One that declared a
+        visibility keeps it — wider or narrower than the raw, either way —
+        because that was a choice, and `PATCH /visibility` clears the flag for
+        the same reason.
+        """
 
         definition = """
         file_id       : char(32)      # opaque handle used in URLs
@@ -106,10 +125,13 @@ def get_schema() -> SimpleNamespace:
         size_bytes    : bigint
         spyglass_name : varchar(255)  # name the client knows it by
         file_class    : enum('raw','analysis')
+        parent=null   : varchar(64)   # raw this was derived from; see nwbfile.py
+        inherits=0    : bool          # take the parent's audience, and follow it
         -> Account.proj(owner='account_id')
         registered=CURRENT_TIMESTAMP : timestamp
         index (sha256)
         index (spyglass_name)
+        index (parent)
         """
 
     @schema

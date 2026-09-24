@@ -16,7 +16,11 @@ import boto3
 from botocore.config import Config
 
 from spyglass_store.settings import Settings, get_settings
-from spyglass_store.storage import PresignedUpload, checksum_header
+from spyglass_store.storage import (
+    PresignedUpload,
+    checksum_header,
+    md5_header,
+)
 
 
 class S3ObjectStore:
@@ -225,6 +229,7 @@ class S3ObjectStore:
         key: str,
         ttl_seconds: int | None = None,
         sha256: str | None = None,
+        content_md5: str | None = None,
     ) -> PresignedUpload:
         """Return a time-limited target for writing `key`.
 
@@ -246,6 +251,11 @@ class S3ObjectStore:
             Lifetime. Defaults to the configured presign TTL.
         sha256 : str, optional
             Hex digest the uploaded bytes must hash to.
+        content_md5 : str, optional
+            Hex MD5 of the same bytes, supplied by the client because the
+            broker never sees them. Sent as `Content-MD5`, which some stores
+            enforce when they ignore the SHA-256 checksum — see
+            `storage.md5_header`.
 
         Returns
         -------
@@ -259,6 +269,14 @@ class S3ObjectStore:
             encoded = checksum_header(sha256)
             params["ChecksumSHA256"] = encoded
             headers["x-amz-checksum-sha256"] = encoded
+
+        # Both, when both are known. Ceph RGW checks only this one; MinIO and
+        # R2 check both. Whichever store is behind the endpoint then enforces
+        # the strongest check it supports.
+        if content_md5 and self.settings.s3_enforce_upload_checksum:
+            encoded = md5_header(content_md5)
+            params["ContentMD5"] = encoded
+            headers["Content-MD5"] = encoded
 
         url = self._client.generate_presigned_url(
             "put_object",

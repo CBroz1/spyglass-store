@@ -22,6 +22,13 @@ Two properties are worth defending as the broker grows:
 
 - **Deny by default.** An empty rule set grants nothing. Every path that says
   yes has to say so explicitly.
+
+  Not to be confused with the *registration* default, which is public: a caller
+  who omits `visibility` is asking for a public file, and `rules_for` writes an
+  explicit public grant to say so. The distinction matters because it is what
+  keeps the failure direction safe — a grant row lost to a failed transaction
+  leaves a file readable by its owner alone, never by everyone, whatever the
+  uploader asked for.
 - **No ambient access.** Membership is not inferred from sharing a team with
   the owner. Spyglass uses that permissive rule to guard against accidental
   deletes among known collaborators; outbound publication is the opposite

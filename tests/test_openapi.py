@@ -15,6 +15,7 @@ SPEC_PATH = Path(__file__).resolve().parents[1] / "openapi.yaml"
 #: Every endpoint the Spyglass client depends on. Removing one is a breaking
 #: change that requires a new version path, not an edit here.
 REQUIRED_OPERATIONS = {
+    ("/info", "get"),
     ("/auth/device", "post"),
     ("/auth/token", "post"),
     ("/file/resolve", "get"),
@@ -161,9 +162,7 @@ def test_the_object_store_image_matches_the_deployment() -> None:
     Duplication is the right shape; drift is the risk, so assert it here
     instead of relying on someone remembering.
 
-    It has already caught us once. MinIO withdrew their images from Docker
-    Hub, and a stale local cache hid it completely while CI could not pull at
-    all. When you bump one, this fails until you bump the other.
+    When you bump one, this fails until you bump the other.
     """
     import re
 

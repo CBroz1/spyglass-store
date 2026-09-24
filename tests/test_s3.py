@@ -229,3 +229,96 @@ def test_unreachable_bucket_names_the_configuration() -> None:
     assert BUCKET in message
     assert "r2.cloudflarestorage.com" in message
     assert "auto" in message  # the region, a common R2 misconfiguration
+
+
+def test_both_integrity_headers_are_signed_when_both_are_known():
+    """The adapter sends `Content-MD5` alongside the SHA-256 checksum.
+
+    Stores disagree about which they honour — Ceph RGW signs
+    `x-amz-checksum-sha256` and then ignores the bytes, while enforcing
+    `Content-MD5`; MinIO and R2 check both. Sending both leaves each store
+    enforcing the strongest check it supports, and none weaker than before.
+
+    What is asserted here is what this package does: the values are signed
+    into the request and returned for the client to send. Whether a particular
+    store then honours them is that store's behaviour, not this package's.
+    """
+    import base64
+    import hashlib
+
+    payload = b"both headers"
+    sha = hashlib.sha256(payload).hexdigest()
+    md5 = hashlib.md5(payload).hexdigest()
+
+    client = _FakeClient()
+    store = S3ObjectStore(Settings(s3_bucket=BUCKET), client=client)
+    upload = store.presigned_put(KEY, 300, sha256=sha, content_md5=md5)
+
+    _, params, _ = client.presigned[-1]
+
+    assert (
+        params["ChecksumSHA256"]
+        == base64.b64encode(bytes.fromhex(sha)).decode()
+    )
+    assert params["ContentMD5"] == base64.b64encode(bytes.fromhex(md5)).decode()
+    assert upload.headers == {
+        "x-amz-checksum-sha256": params["ChecksumSHA256"],
+        "Content-MD5": params["ContentMD5"],
+    }, "the client has to send exactly what was signed"
+
+
+def test_an_absent_md5_signs_only_the_checksum():
+    """It is optional: a client that sends no MD5 still gets an upload URL."""
+    client = _FakeClient()
+    store = S3ObjectStore(Settings(s3_bucket=BUCKET), client=client)
+    upload = store.presigned_put(KEY, 300, sha256="a" * 64)
+
+    _, params, _ = client.presigned[-1]
+
+    assert "ContentMD5" not in params
+    assert "Content-MD5" not in upload.headers
+    assert "x-amz-checksum-sha256" in upload.headers
+
+
+def test_md5_header_converts_hex_to_base64():
+    """S3 carries the digest base64; the registry speaks hex."""
+    import base64
+    import hashlib
+
+    from spyglass_store.storage import md5_header
+
+    payload = b"conversion check"
+    expected = base64.b64encode(hashlib.md5(payload).digest()).decode()
+
+    assert md5_header(hashlib.md5(payload).hexdigest()) == expected
+
+
+def test_md5_header_refuses_anything_that_is_not_a_hex_digest():
+    """A malformed digest must fail here, not as an opaque 403 from the store."""
+    import pytest
+
+    from spyglass_store.storage import md5_header
+
+    for bad in ("", "xyz", "0" * 31, "0" * 33, "A" * 32):
+        with pytest.raises(ValueError, match="32-character"):
+            md5_header(bad)
+
+
+def test_enforcement_off_signs_neither_header():
+    """One switch governs both, so turning it off is unambiguous."""
+    from spyglass_store.s3 import S3ObjectStore
+    from spyglass_store.settings import Settings
+
+    store = S3ObjectStore(
+        Settings(
+            s3_endpoint_url="https://objects.example.org",
+            s3_access_key="k",
+            s3_secret_key="s",
+            s3_enforce_upload_checksum=False,
+        )
+    )
+    upload = store.presigned_put(
+        "k", 300, sha256="a" * 64, content_md5="b" * 32
+    )
+
+    assert upload.headers == {}

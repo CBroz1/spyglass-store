@@ -72,7 +72,7 @@ class _Store:
     def read_range(self, key, offset, length):  # pragma: no cover
         return b""
 
-    def presigned_put(self, key, ttl, sha256=None):
+    def presigned_put(self, key, ttl, sha256=None, content_md5=None):
         from spyglass_store.storage import PresignedUpload, checksum_header
 
         self.put_presigned.append((key, ttl, sha256))
@@ -127,7 +127,15 @@ class _Registry:
         return self.registered.get((sha256, name, owner))
 
     def register_file(
-        self, *, sha256, size_bytes, spyglass_name, file_class, owner, rules=()
+        self,
+        *,
+        sha256,
+        size_bytes,
+        spyglass_name,
+        file_class,
+        owner,
+        rules=(),
+        inherit_if_parent=False,
     ):
         record = FileRecord(
             file_id=f"id{len(self.registered)}",
@@ -422,10 +430,9 @@ def test_malformed_hash_is_rejected(client):
 
 @pytest.fixture
 def vis_client(client):
-    """Kept as a name for readability; the fake registry records the writes.
+    """The same client, under a name that says what these tests are about.
 
-    It used to patch `replace_rules` onto the module. With the registry
-    injected there is nothing left to patch.
+    The fake registry records the writes, so there is nothing to patch.
     """
     return client
 
@@ -643,3 +650,83 @@ def test_visibility_response_is_typed(vis_client):
         "scope": "group",
         "teams": ["teamA"],
     }
+
+
+def test_a_request_for_absent_bytes_is_logged(client, reg, store):
+    """The only record that anyone wanted a file that was not there.
+
+    `reconcile` can name registrations with no bytes; it cannot say which of
+    them someone is waiting for, and that is what tells an operator what to
+    upload first. Without the row, an authenticated caller could also probe
+    whether an object exists and leave no trace at all.
+    """
+    reg.rules = (AccessRule(Principal.PUBLIC),)
+    store.has_object = False
+
+    r = client.get(
+        f"/api/v1/file/{OWNER.file_id}/content",
+        headers=auth("owner"),
+        follow_redirects=False,
+    )
+
+    assert r.status_code == 409
+    entry = reg.logged[-1]
+    assert entry["action"] == "read"
+    assert entry["granted"] is False
+    assert entry["file_id"] == OWNER.file_id
+    assert entry.get("size_bytes", 0) == 0, "nothing was transferred"
+
+
+def test_info_asks_for_an_md5_when_the_store_ignores_the_checksum(store, reg):
+    """A client should not hash a gigabyte for a digest nobody checks.
+
+    Ceph RGW signs `x-amz-checksum-sha256` and then stores whatever arrives,
+    so a deployment on it needs the MD5 as well. One operator setting decides
+    it, and the client reads the answer rather than guessing per backend.
+    """
+    from fastapi.testclient import TestClient
+
+    from spyglass_store.app import create_app
+    from spyglass_store.settings import Settings
+
+    client = TestClient(
+        create_app(
+            verifier=_Verifier(),
+            store=store,
+            github=object(),
+            registry_module=reg,
+            settings=Settings(s3_store_verifies_sha256=False),
+        )
+    )
+
+    body = client.get("/api/v1/info", headers=auth("owner")).json()
+
+    assert body["upload_digests"] == ["sha256", "md5"]
+
+
+def test_info_asks_for_sha256_alone_when_the_store_checks_it(store, reg):
+    """MinIO and R2 verify it, so the second digest is wasted work."""
+    from fastapi.testclient import TestClient
+
+    from spyglass_store.app import create_app
+    from spyglass_store.settings import Settings
+
+    client = TestClient(
+        create_app(
+            verifier=_Verifier(),
+            store=store,
+            github=object(),
+            registry_module=reg,
+            settings=Settings(s3_store_verifies_sha256=True),
+        )
+    )
+
+    body = client.get("/api/v1/info", headers=auth("owner")).json()
+
+    assert body["upload_digests"] == ["sha256"]
+    assert body["api_version"] == "v1"
+
+
+def test_info_needs_a_token(client):
+    """It describes the deployment, and an anonymous caller has no upload."""
+    assert client.get("/api/v1/info").status_code == 401

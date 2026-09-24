@@ -202,16 +202,25 @@ def test_every_variable_in_a_template_has_a_default(
 
 
 def test_rendering_leaves_nginx_own_variables_alone(
-    edge_env: dict, proxy: str
+    edge_env: dict, templates: dict
 ) -> None:
     """envsubst substitutes every name it is given, and nginx is full of them.
 
-    Unfiltered, `$host` or `$remote_addr` would be replaced by whatever happens
-    to be in the container's environment — most likely nothing, which silently
-    guts `proxy_set_header` and the limiter's key.
+    Unfiltered, these would be replaced by whatever happens to be in the
+    container's environment — most likely nothing, which silently guts
+    `proxy_set_header` and the limiter's key while nginx still starts.
     """
     assert edge_env.get("NGINX_ENVSUBST_FILTER") == "^SPYGLASS_STORE_EDGE_"
-    assert "$binary_remote_addr" in proxy or "$binary_remote_addr" in str(proxy)
+
+    rendered = "\n".join(templates.values())
+
+    for variable in (
+        "$binary_remote_addr",  # what the limits key on
+        "$host",
+        "$scheme",
+        "$proxy_add_x_forwarded_for",
+    ):
+        assert variable in rendered, f"{variable} no longer reaches nginx"
 
 
 def test_the_example_env_file_can_be_committed() -> None:
@@ -394,12 +403,12 @@ def test_the_object_store_console_is_not_published_broadly(
     The store's data port is published on purpose — clients follow presigned
     URLs to it. Its console is not the same thing.
     """
-    for entry in compose["services"]["store"]["ports"]:
-        if str(entry).endswith("9001"):
-            assert str(entry).startswith("127.0.0.1:"), (
-                f"the MinIO console is published as {entry}; bind it to "
-                "loopback"
-            )
+    published = [str(entry) for entry in compose["services"]["store"]["ports"]]
+
+    assert published == ["9000:8080"], (
+        "the store should publish its S3 API and nothing else; an admin or "
+        f"dashboard port does not belong on the host. Publishes: {published}"
+    )
 
 
 # --------------------------- staying up ---------------------------
@@ -422,12 +431,12 @@ def test_the_edge_waits_for_a_broker_that_works(compose: dict) -> None:
 def test_long_running_services_restart(compose: dict) -> None:
     """A broker that exits on a transient fault should come back.
 
-    Not the bucket-creation job, though: it exits 0 by design, and restarting
-    it forever would leave the deployment looking permanently unhealthy.
+    Every service here is long-running: the store image creates its own
+    bucket, so there is no one-shot job to exempt.
     """
     services = compose["services"]
 
-    for name in ("broker", "edge", "store"):
-        assert services[name].get("restart") == "unless-stopped", name
+    assert set(services) == {"broker", "edge", "store"}
 
-    assert services["createbucket"].get("restart") == "no"
+    for name, service in services.items():
+        assert service.get("restart") == "unless-stopped", name

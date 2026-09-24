@@ -88,7 +88,7 @@ conda env create -f environment.yml
 conda activate spyglass-store
 pre-commit install
 
-# The suite starts its own MySQL and MinIO containers, so Docker must be
+# The suite starts its own MySQL and Ceph containers, so Docker must be
 # running. Point --container-vol-dir at a disk with room: MySQL wants a 2 GB
 # log before it starts, and Docker's default volume root is usually on `/`.
 pytest --container-vol-dir=/path/on/a/roomy/disk

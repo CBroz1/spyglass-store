@@ -718,7 +718,9 @@ def quota_client(db, broker_tables, member, uploader):
         def size(self, key):
             return None
 
-        def presigned_put(self, key, ttl, sha256=None):  # pragma: no cover
+        def presigned_put(
+            self, key, ttl, sha256=None, content_md5=None
+        ):  # pragma: no cover
             from spyglass_store.storage import PresignedUpload
 
             return PresignedUpload("", {})
@@ -1120,3 +1122,719 @@ def test_the_meter_reports_the_oldest_charge_inside_the_window(db, uploader):
 
     assert usage.total_bytes == 10, "the 30h-old charge has aged out"
     assert usage.earliest == now - timedelta(hours=6)
+
+
+# ----------------------- provenance: the parent edge -----------------------
+
+
+def test_verify_nwbfile_schema_passes_against_real_tables(db, nwbfile_tables):
+    """The startup check must accept the schema Spyglass actually declares."""
+    from spyglass_store.nwbfile import verify_nwbfile_schema
+
+    verify_nwbfile_schema()  # raises if a column the broker reads is gone
+
+
+def test_an_analysis_file_records_the_raw_it_came_from(
+    db, uploader, nwbfile_tables
+):
+    """Inheriting a raw's visibility needs the edge, and Spyglass has it.
+
+    Read from `AnalysisNwbfile`, never from the request: a caller who could
+    name their own parent could choose whose audience to inherit.
+    """
+    from spyglass_store import registry
+
+    Nwbfile, AnalysisNwbfile = nwbfile_tables
+    Nwbfile.insert1({"nwb_file_name": "prov_.nwb"})
+    AnalysisNwbfile.insert1(
+        {
+            "analysis_file_name": "prov_ABCDEFGHIJ.nwb",
+            "nwb_file_name": "prov_.nwb",
+        }
+    )
+
+    file = registry.register_file(
+        sha256="c" * 64,
+        size_bytes=10,
+        spyglass_name="prov_ABCDEFGHIJ.nwb",
+        file_class="analysis",
+        owner=uploader,
+    )
+
+    assert file.parent == "prov_.nwb"
+    assert registry.file_by_id(file.file_id).parent == "prov_.nwb"
+
+
+def test_a_raw_file_records_no_parent(db, uploader, nwbfile_tables):
+    """A raw file is nobody's derivative, and answering costs no query."""
+    from spyglass_store import registry
+
+    file = registry.register_file(
+        sha256="d" * 64,
+        size_bytes=10,
+        spyglass_name="prov_.nwb",
+        file_class="raw",
+        owner=uploader,
+    )
+
+    assert file.parent is None
+
+
+def test_an_analysis_name_spyglass_never_recorded_still_registers(
+    db, uploader, nwbfile_tables
+):
+    """Policing what the instance knows is not the broker's job.
+
+    A file shared before its row exists — or from an instance whose tables this
+    broker does not serve — registers with no parent rather than being refused.
+    """
+    from spyglass_store import registry
+
+    file = registry.register_file(
+        sha256="e" * 64,
+        size_bytes=10,
+        spyglass_name="unknown_KLMNOPQRST.nwb",
+        file_class="analysis",
+        owner=uploader,
+    )
+
+    assert file.parent is None
+
+
+def test_the_parent_is_frozen_at_registration(db, uploader, nwbfile_tables):
+    """`AnalysisNwbfile` is user-writable, unlike the lab tables.
+
+    A live lookup on every read would let whoever can write that table
+    re-point the provenance of a registration that already exists, and with it
+    whatever the broker decides from it.
+    """
+    from spyglass_store import registry
+
+    Nwbfile, AnalysisNwbfile = nwbfile_tables
+    Nwbfile.insert(
+        [{"nwb_file_name": "first_.nwb"}, {"nwb_file_name": "second_.nwb"}]
+    )
+    key = {"analysis_file_name": "moved_ABCDEFGHIJ.nwb"}
+    AnalysisNwbfile.insert1({**key, "nwb_file_name": "first_.nwb"})
+
+    file = registry.register_file(
+        sha256="f" * 64,
+        size_bytes=10,
+        spyglass_name="moved_ABCDEFGHIJ.nwb",
+        file_class="analysis",
+        owner=uploader,
+    )
+
+    AnalysisNwbfile.update1({**key, "nwb_file_name": "second_.nwb"})
+
+    assert registry.file_by_id(file.file_id).parent == "first_.nwb"
+
+
+# ------------------- provenance: inherited visibility -------------------
+
+
+def _second_account(github_id, login):
+    """Add another verified account and return its id.
+
+    Stands in for a compute host, or for a bad actor — the point of several of
+    these tests is what one identity may reach of another's.
+    """
+    from spyglass_store import registry
+
+    Account, _, _ = registry.tables()
+    Account.insert1(
+        {
+            "github_id": github_id,
+            "github_login": login,
+            "tier": "verified",
+            "github_created": "2020-01-01",
+        }
+    )
+
+    return str((Account & {"github_id": github_id}).fetch1("account_id"))
+
+
+class _PresentStore:
+    """A store that holds every object asked for."""
+
+    def exists(self, key):
+        return True
+
+    def size(self, key):
+        return None
+
+    def presigned_get(self, key, ttl):
+        return "https://objects.example.org/signed"
+
+
+def _client():
+    """The app, against a store that has everything."""
+    from fastapi.testclient import TestClient
+
+    from spyglass_store.app import create_app
+    from spyglass_store.settings import Settings
+
+    return TestClient(
+        create_app(store=_PresentStore(), github=object(), settings=Settings())
+    )
+
+
+def _declare_lineage(nwbfile_tables, raw, analysis):
+    """Record in Spyglass that `analysis` was derived from `raw`."""
+    Nwbfile, AnalysisNwbfile = nwbfile_tables
+    Nwbfile.insert1({"nwb_file_name": raw})
+    AnalysisNwbfile.insert1(
+        {"analysis_file_name": analysis, "nwb_file_name": raw}
+    )
+
+
+def test_a_derivative_is_readable_by_the_owner_of_its_raw(
+    db, uploader, nwbfile_tables
+):
+    """The workflow this exists for.
+
+    A user uploads a private raw. A shared compute host runs a pipeline and
+    registers the result under *its own* account, because that is whose token
+    sits on that host. Without inheritance the person whose data it is would be
+    locked out of their own result, while the compute account that happened to
+    upload it would not.
+    """
+    from spyglass_store import registry
+
+    _declare_lineage(nwbfile_tables, "inherit_.nwb", "inherit_ABCDEFGHIJ.nwb")
+    registry.register_file(
+        sha256="1" * 64,
+        size_bytes=10,
+        spyglass_name="inherit_.nwb",
+        file_class="raw",
+        owner=uploader,
+    )
+    host = _second_account(4242, "compute-host")
+    derivative = registry.register_file(
+        sha256="2" * 64,
+        size_bytes=10,
+        spyglass_name="inherit_ABCDEFGHIJ.nwb",
+        file_class="analysis",
+        owner=host,
+        # The compute host declared nothing, so the raw decides.
+        inherit_if_parent=True,
+    )
+
+    client = _client()
+    url = f"/api/v1/file/{derivative.file_id}/content"
+
+    owner_read = client.get(
+        url,
+        headers={"Authorization": f"Bearer {registry.issue_token(uploader)}"},
+        follow_redirects=False,
+    )
+    host_read = client.get(
+        url,
+        headers={"Authorization": f"Bearer {registry.issue_token(host)}"},
+        follow_redirects=False,
+    )
+
+    assert owner_read.status_code == 302, "the raw's owner reads it"
+    assert host_read.status_code == 302, "so does the account that uploaded it"
+
+
+def test_resolving_by_name_agrees_with_reading_by_id(
+    db, uploader, nwbfile_tables
+):
+    """A file readable by id and invisible by name would be a trap.
+
+    `resolve` is how a client finds the id in the first place, so both paths
+    have to apply the same rule.
+    """
+    from spyglass_store import registry
+
+    _declare_lineage(nwbfile_tables, "byname_.nwb", "byname_ABCDEFGHIJ.nwb")
+    registry.register_file(
+        sha256="a1" * 32,
+        size_bytes=10,
+        spyglass_name="byname_.nwb",
+        file_class="raw",
+        owner=uploader,
+    )
+    host = _second_account(4343, "compute-two")
+    registry.register_file(
+        sha256="a2" * 32,
+        size_bytes=10,
+        spyglass_name="byname_ABCDEFGHIJ.nwb",
+        file_class="analysis",
+        owner=host,
+        inherit_if_parent=True,
+    )
+
+    r = _client().get(
+        "/api/v1/file/resolve",
+        params={"name": "byname_ABCDEFGHIJ.nwb"},
+        headers={"Authorization": f"Bearer {registry.issue_token(uploader)}"},
+    )
+
+    assert r.status_code == 200
+    assert r.json()["spyglass_name"] == "byname_ABCDEFGHIJ.nwb"
+
+
+def test_a_stranger_cannot_read_a_derivative_of_a_private_raw(
+    db, uploader, nwbfile_tables
+):
+    """Inheritance adds the raw's audience, and nobody else."""
+    from spyglass_store import registry
+
+    _declare_lineage(nwbfile_tables, "secret_.nwb", "secret_ABCDEFGHIJ.nwb")
+    registry.register_file(
+        sha256="3" * 64,
+        size_bytes=10,
+        spyglass_name="secret_.nwb",
+        file_class="raw",
+        owner=uploader,
+    )
+    derivative = registry.register_file(
+        sha256="4" * 64,
+        size_bytes=10,
+        spyglass_name="secret_ABCDEFGHIJ.nwb",
+        file_class="analysis",
+        owner=uploader,
+    )
+    stranger = _second_account(5150, "stranger")
+
+    r = _client().get(
+        f"/api/v1/file/{derivative.file_id}/content",
+        headers={"Authorization": f"Bearer {registry.issue_token(stranger)}"},
+        follow_redirects=False,
+    )
+
+    assert r.status_code == 403
+
+
+def test_a_planted_raw_name_claims_nothing(db, uploader, nwbfile_tables):
+    """The attack inherited visibility would otherwise open.
+
+    The provenance edge Spyglass records is a *name*. A bad actor who posts a
+    novel `R.nwb` of their own — public, so they can read it — must not thereby
+    inherit access to derivatives of the real R. Refusing the clashing
+    registration is what closes it: the name already means one file.
+    """
+    from spyglass_store import registry
+    from spyglass_store.access import Scope, rules_for
+
+    _declare_lineage(nwbfile_tables, "target_.nwb", "target_ABCDEFGHIJ.nwb")
+    registry.register_file(
+        sha256="b1" * 32,
+        size_bytes=10,
+        spyglass_name="target_.nwb",
+        file_class="raw",
+        owner=uploader,
+    )
+    registry.register_file(
+        sha256="b2" * 32,
+        size_bytes=10,
+        spyglass_name="target_ABCDEFGHIJ.nwb",
+        file_class="analysis",
+        owner=uploader,
+    )
+    attacker = _second_account(6660, "bad-actor")
+
+    with pytest.raises(registry.ContentConflict):
+        registry.register_file(
+            sha256="ff" * 32,  # their own bytes, not the real raw's
+            size_bytes=10,
+            spyglass_name="target_.nwb",
+            file_class="raw",
+            owner=attacker,
+            rules=rules_for(Scope.PUBLIC),
+        )
+
+    assert len(registry.files_by_name("target_.nwb")) == 1
+
+
+def test_two_accounts_may_still_register_the_same_raw(
+    db, uploader, nwbfile_tables
+):
+    """Deduplication is the designed-for case and must keep working.
+
+    The rule is that registrations of one raw name agree about its content, not
+    that only one may exist. Two owners registering the same bytes each get a
+    registration, sharing one object.
+    """
+    from spyglass_store import registry
+
+    other = _second_account(6161, "second-owner")
+
+    for owner in (uploader, other):
+        registry.register_file(
+            sha256="7" * 64,
+            size_bytes=10,
+            spyglass_name="shared_raw_.nwb",
+            file_class="raw",
+            owner=owner,
+        )
+
+    assert len(registry.files_by_name("shared_raw_.nwb")) == 2
+
+
+def test_a_regenerated_analysis_file_may_reuse_its_name(
+    db, uploader, nwbfile_tables
+):
+    """The rule is deliberately raw-only.
+
+    A re-run producing different bytes under the same analysis name is
+    expected, and nothing inherits *from* an analysis file.
+    """
+    from spyglass_store import registry
+
+    for digest in ("8" * 64, "9" * 64):
+        registry.register_file(
+            sha256=digest,
+            size_bytes=10,
+            spyglass_name="rerun_ABCDEFGHIJ.nwb",
+            file_class="analysis",
+            owner=uploader,
+        )
+
+    assert len(registry.files_by_name("rerun_ABCDEFGHIJ.nwb")) == 2
+
+
+def test_a_clashing_raw_registration_is_refused_over_http(
+    db, uploader, nwbfile_tables
+):
+    """The rule has to reach the client as a 409, not a 500.
+
+    409 rather than 422: the request is well-formed, and it would have been
+    accepted before someone else registered that name. The caller needs to be
+    able to tell "you sent nonsense" from "this name already means a different
+    file".
+    """
+    from fastapi.testclient import TestClient
+
+    from spyglass_store import registry
+    from spyglass_store.app import create_app
+    from spyglass_store.settings import Settings
+
+    class _EmptyStore:
+        """Holds nothing, so no possession challenge stands in the way."""
+
+        def exists(self, key):
+            return False
+
+        def size(self, key):
+            return None
+
+        def presigned_put(self, key, ttl, sha256=None, content_md5=None):
+            from spyglass_store.storage import PresignedUpload
+
+            return PresignedUpload("https://objects.example.org/put", {})
+
+    client = TestClient(
+        create_app(
+            store=_EmptyStore(),
+            github=object(),
+            settings=Settings(require_possession_proof=False),
+        )
+    )
+    headers = {"Authorization": f"Bearer {registry.issue_token(uploader)}"}
+    body = {
+        "size_bytes": 10,
+        "spyglass_name": "overhttp_.nwb",
+        "file_class": "raw",
+    }
+
+    first = client.post(
+        "/api/v1/file", json={**body, "sha256": "c1" * 32}, headers=headers
+    )
+    second = client.post(
+        "/api/v1/file", json={**body, "sha256": "c2" * 32}, headers=headers
+    )
+
+    assert first.status_code == 201
+    assert second.status_code == 409
+    assert "different content" in second.json()["detail"]
+
+
+def test_an_upload_that_declares_nothing_is_public(
+    db, uploader, nwbfile_tables
+):
+    """Shared storage exists to be shared, so the default is public.
+
+    Asserted end to end rather than on the model, because what matters is the
+    grant row that ends up in the database: a caller who omits `visibility`
+    gets an explicit public grant, not an absent one. The distinction is what
+    keeps the failure direction safe — a grant lost to a failed transaction
+    leaves a file readable by its owner alone, whatever was asked for.
+    """
+    from fastapi.testclient import TestClient
+
+    from spyglass_store import registry
+    from spyglass_store.access import Principal
+    from spyglass_store.app import create_app
+    from spyglass_store.settings import Settings
+
+    class _EmptyStore:
+        def exists(self, key):
+            return False
+
+        def size(self, key):
+            return None
+
+        def presigned_put(self, key, ttl, sha256=None, content_md5=None):
+            from spyglass_store.storage import PresignedUpload
+
+            return PresignedUpload("https://objects.example.org/put", {})
+
+    client = TestClient(
+        create_app(
+            store=_EmptyStore(),
+            github=object(),
+            settings=Settings(require_possession_proof=False),
+        )
+    )
+
+    r = client.post(
+        "/api/v1/file",
+        json={
+            "sha256": "d1" * 32,
+            "size_bytes": 10,
+            "spyglass_name": "bydefault_.nwb",
+            "file_class": "raw",
+        },
+        headers={"Authorization": f"Bearer {registry.issue_token(uploader)}"},
+    )
+
+    assert r.status_code == 201
+    rules = registry.rules_for_file(r.json()["file_id"])
+
+    assert [rule.principal_type for rule in rules] == [Principal.PUBLIC]
+
+
+def test_an_omitted_visibility_stays_absent_on_the_model(db):
+    """Absence has to survive parsing, because it means something.
+
+    An omitted visibility is "decide for me" — public for a raw, the raw's
+    own audience for a derivative. A model default of `public` would erase
+    that distinction before any route could act on it, and every derivative
+    would arrive claiming it had been declared public.
+    """
+    from spyglass_store.models import FileRegistrationIn
+
+    body = FileRegistrationIn(
+        sha256="e" * 64,
+        size_bytes=1,
+        spyglass_name="x_.nwb",
+        file_class="raw",
+    )
+
+    assert body.visibility is None
+
+    declared = FileRegistrationIn(
+        sha256="e" * 64,
+        size_bytes=1,
+        spyglass_name="x_.nwb",
+        file_class="raw",
+        visibility={"scope": "public"},
+    )
+
+    assert declared.visibility is not None
+    assert declared.visibility.scope == "public"
+
+
+# ----------------- visibility: declared, or taken from the raw -----------------
+
+
+def test_an_undeclared_derivative_follows_its_raw(db, uploader, nwbfile_tables):
+    """Unset means "scope it from the raw", and keep following it.
+
+    Re-scoping a session should re-scope what was computed from it, without
+    anyone re-declaring each result. The parent's grants are read at read time,
+    so the cascade needs no relay from the client.
+    """
+    from spyglass_store import registry
+    from spyglass_store.access import Scope, rules_for
+
+    _declare_lineage(nwbfile_tables, "follow_.nwb", "follow_ABCDEFGHIJ.nwb")
+    raw = registry.register_file(
+        sha256="e1" * 32,
+        size_bytes=10,
+        spyglass_name="follow_.nwb",
+        file_class="raw",
+        owner=uploader,
+        rules=(),  # private
+    )
+    derivative = registry.register_file(
+        sha256="e2" * 32,
+        size_bytes=10,
+        spyglass_name="follow_ABCDEFGHIJ.nwb",
+        file_class="analysis",
+        owner=uploader,
+        inherit_if_parent=True,
+    )
+    stranger = _second_account(7010, "follower")
+    client = _client()
+    url = f"/api/v1/file/{derivative.file_id}/content"
+    headers = {"Authorization": f"Bearer {registry.issue_token(stranger)}"}
+
+    assert registry.file_by_id(derivative.file_id).inherits is True
+    assert (
+        client.get(url, headers=headers, follow_redirects=False).status_code
+        == 403
+    )
+
+    # Open the raw; the derivative opens with it, with nothing re-declared.
+    registry.replace_rules(raw.file_id, rules_for(Scope.PUBLIC))
+
+    assert (
+        client.get(url, headers=headers, follow_redirects=False).status_code
+        == 302
+    )
+
+
+def test_a_declared_derivative_keeps_what_it_declared(
+    db, uploader, nwbfile_tables
+):
+    """Narrower than the raw is a choice, and choices are honoured.
+
+    This is the case that a union rule got wrong: a derivative declared
+    private under a public raw would have been served to everyone, while the
+    client's own tables said private.
+    """
+    from spyglass_store import registry
+    from spyglass_store.access import Scope, rules_for
+
+    _declare_lineage(nwbfile_tables, "narrow_.nwb", "narrow_ABCDEFGHIJ.nwb")
+    registry.register_file(
+        sha256="e3" * 32,
+        size_bytes=10,
+        spyglass_name="narrow_.nwb",
+        file_class="raw",
+        owner=uploader,
+        rules=rules_for(Scope.PUBLIC),
+    )
+    derivative = registry.register_file(
+        sha256="e4" * 32,
+        size_bytes=10,
+        spyglass_name="narrow_ABCDEFGHIJ.nwb",
+        file_class="analysis",
+        owner=uploader,
+        rules=(),  # declared private, under a public raw
+    )
+    stranger = _second_account(7020, "outsider")
+
+    r = _client().get(
+        f"/api/v1/file/{derivative.file_id}/content",
+        headers={"Authorization": f"Bearer {registry.issue_token(stranger)}"},
+        follow_redirects=False,
+    )
+
+    assert registry.file_by_id(derivative.file_id).inherits is False
+    assert r.status_code == 403, "a declared scope is not widened by its raw"
+
+
+def test_a_derivative_may_be_declared_wider_than_its_raw(
+    db, uploader, nwbfile_tables
+):
+    """The owner is allowed to publish a result from a private session."""
+    from spyglass_store import registry
+    from spyglass_store.access import Scope, rules_for
+
+    _declare_lineage(nwbfile_tables, "wide_.nwb", "wide_ABCDEFGHIJ.nwb")
+    registry.register_file(
+        sha256="e5" * 32,
+        size_bytes=10,
+        spyglass_name="wide_.nwb",
+        file_class="raw",
+        owner=uploader,
+        rules=(),  # private raw
+    )
+    derivative = registry.register_file(
+        sha256="e6" * 32,
+        size_bytes=10,
+        spyglass_name="wide_ABCDEFGHIJ.nwb",
+        file_class="analysis",
+        owner=uploader,
+        rules=rules_for(Scope.PUBLIC),
+    )
+    stranger = _second_account(7030, "reader")
+
+    r = _client().get(
+        f"/api/v1/file/{derivative.file_id}/content",
+        headers={"Authorization": f"Bearer {registry.issue_token(stranger)}"},
+        follow_redirects=False,
+    )
+
+    assert r.status_code == 302
+
+
+def test_setting_a_visibility_stops_it_following_the_raw(
+    db, uploader, nwbfile_tables
+):
+    """Otherwise narrowing a derivative would be undone by the next read."""
+    from spyglass_store import registry
+
+    _declare_lineage(nwbfile_tables, "stop_.nwb", "stop_ABCDEFGHIJ.nwb")
+    registry.register_file(
+        sha256="e7" * 32,
+        size_bytes=10,
+        spyglass_name="stop_.nwb",
+        file_class="raw",
+        owner=uploader,
+        rules=(),
+    )
+    derivative = registry.register_file(
+        sha256="e8" * 32,
+        size_bytes=10,
+        spyglass_name="stop_ABCDEFGHIJ.nwb",
+        file_class="analysis",
+        owner=uploader,
+        inherit_if_parent=True,
+    )
+
+    assert registry.file_by_id(derivative.file_id).inherits is True
+
+    registry.replace_rules(derivative.file_id, ())
+
+    assert registry.file_by_id(derivative.file_id).inherits is False
+
+
+def test_an_undeclared_raw_is_public_over_http(db, uploader, nwbfile_tables):
+    """Unset on a raw means public, and the route is where that is decided."""
+    from fastapi.testclient import TestClient
+
+    from spyglass_store import registry
+    from spyglass_store.access import Principal
+    from spyglass_store.app import create_app
+    from spyglass_store.settings import Settings
+
+    class _EmptyStore:
+        def exists(self, key):
+            return False
+
+        def size(self, key):
+            return None
+
+        def presigned_put(self, key, ttl, sha256=None, content_md5=None):
+            from spyglass_store.storage import PresignedUpload
+
+            return PresignedUpload("https://objects.example.org/put", {})
+
+    client = TestClient(
+        create_app(
+            store=_EmptyStore(),
+            github=object(),
+            settings=Settings(require_possession_proof=False),
+        )
+    )
+    r = client.post(
+        "/api/v1/file",
+        json={
+            "sha256": "e9" * 32,
+            "size_bytes": 10,
+            "spyglass_name": "undeclared_.nwb",
+            "file_class": "raw",
+        },
+        headers={"Authorization": f"Bearer {registry.issue_token(uploader)}"},
+    )
+
+    assert r.status_code == 201
+    rules = registry.rules_for_file(r.json()["file_id"])
+
+    assert [rule.principal_type for rule in rules] == [Principal.PUBLIC]

@@ -123,7 +123,7 @@ def s3_settings(s3_server):
 def object_store(s3_settings):
     """A real `S3ObjectStore` against the container, emptied afterwards.
 
-    Nothing here is faked: boto3 signs, MinIO verifies, and bytes move over
+    Nothing here is faked: boto3 signs, the store verifies, and bytes move over
     HTTP. That is the whole point — presigning is exactly the behaviour a
     stub cannot stand in for.
 
@@ -178,6 +178,7 @@ def db(container, monkeypatch_session):
 
     reset()
     _declare_lab_schema(dj)
+    _declare_nwbfile_schema(dj)
 
     yield schema.get_schema()
 
@@ -233,6 +234,57 @@ def _declare_lab_schema(dj) -> None:
             """
 
 
+def _declare_nwbfile_schema(dj) -> None:
+    """Create the two Spyglass file tables the broker reflects.
+
+    The broker reads one fact from these: which raw file an analysis file was
+    derived from. `AnalysisNwbfile` records it as a foreign key, which is why
+    the broker reflects the table rather than parsing file names.
+
+    **The `filepath@` attributes are deliberately omitted.** Spyglass declares
+    `nwb_file_abs_path` and `analysis_file_abs_path` as external filepath
+    stores, and declaring them here would need store configuration the broker
+    has none of. Leaving them out also means a query in the broker that fetched
+    a whole row — rather than naming the column it wants — fails in this suite
+    instead of only in production.
+
+    Same host guard as `_declare_lab_schema`, for the same reason: this creates
+    and drops tables under Spyglass's own schema name.
+    """
+    host = str(dj.config["database.host"])
+
+    if host not in {"127.0.0.1", "localhost"}:
+        raise RuntimeError(
+            f"Refusing to declare {nwbfile_module_name()!r} against {host!r}. "
+            "These fixtures create and delete Spyglass's own file tables, so "
+            "they may only run against a local test container."
+        )
+
+    nwb_schema = dj.schema(nwbfile_module_name())
+
+    @nwb_schema
+    class Nwbfile(dj.Manual):
+        definition = """
+        nwb_file_name : varchar(64)
+        """
+
+    @nwb_schema
+    class AnalysisNwbfile(dj.Manual):
+        definition = """
+        analysis_file_name : varchar(64)
+        ---
+        -> Nwbfile
+        analysis_file_description='' : varchar(2000)
+        """
+
+
+def nwbfile_module_name() -> str:
+    """Return the schema name Spyglass declares its file tables under."""
+    from spyglass_store.nwbfile import NWBFILE_SCHEMA
+
+    return NWBFILE_SCHEMA
+
+
 def lab_module_name() -> str:
     """Return the schema name Spyglass declares its lab tables under."""
     from spyglass_store.lab import LAB_SCHEMA
@@ -275,6 +327,25 @@ def lab_tables(db):
     module.LabTeam.delete_quick()
     module.LabMember.LabMemberInfo.delete_quick()
     module.LabMember.delete_quick()
+
+
+@pytest.fixture
+def nwbfile_tables(db):
+    """Empty `Nwbfile` and `AnalysisNwbfile`, refilled per test.
+
+    Yields
+    ------
+    tuple
+        `(Nwbfile, AnalysisNwbfile)` from the reflected module.
+    """
+    from spyglass_store.nwbfile import nwbfile_module
+
+    module = nwbfile_module()
+
+    yield module.Nwbfile, module.AnalysisNwbfile
+
+    module.AnalysisNwbfile.delete_quick()
+    module.Nwbfile.delete_quick()
 
 
 @pytest.fixture

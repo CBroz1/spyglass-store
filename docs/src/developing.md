@@ -12,7 +12,7 @@ pre-commit install
 pytest --container-vol-dir=/path/on/a/roomy/disk
 ```
 
-The suite starts its own containers — MySQL for the registry, MinIO for the
+The suite starts its own containers — MySQL for the registry, Ceph RGW for the
 object store — so **Docker must be running**. MySQL wants a two gigabyte InnoDB
 log before it will start, so use `--container-vol-dir` to point to a disk with
 ample space, or set `SPYGLASS_STORE_DOCKER_VOL_DIR` and forget about it.
@@ -36,9 +36,13 @@ undo that.
 directory cannot make the suite machine-dependent. Tests that want configuration
 construct `Settings(...)` explicitly.
 
-Container images are pinned to specific releases, and MinIO comes from
-`quay.io`. Bump the pins in `tests/container.py` and `deploy/docker-compose.yml`
-together.
+The object store is **Ceph RGW**, the implementation the deployment targets,
+pinned by digest. Bump the pins in `tests/container.py` and
+`deploy/docker-compose.yml` together; a test asserts they agree.
+
+It is a heavy dependency — a gigabyte of image, about a minute before RGW
+serves — and that is the price of meeting the real implementation rather than a
+stand-in.
 
 ## Where things live
 
@@ -54,6 +58,7 @@ src/spyglass_store/
 ├── registry.py   # every database read and write
 ├── schema.py     # the DataJoint tables
 ├── lab.py        # Spyglass's LabMember/LabTeam, reflected not imported
+├── nwbfile.py    # Spyglass's Nwbfile/AnalysisNwbfile, for provenance
 ├── storage.py    # object layout, and the ObjectStore protocol
 ├── s3.py         # the one ObjectStore implementation
 ├── db.py         # connection discipline (see "One connection" below)
@@ -92,8 +97,16 @@ returns 200.
 The consequences follow from that constraint rather than from preference:
 presigned URLs are short-lived because they cannot be revoked; volume is charged
 when a URL is issued because that is the last moment the broker is involved; and
-an upload's hash is verified by the *store*, via a checksum signed into the
+an upload's integrity is checked by the *store*, via digests signed into the
 upload URL, because the broker does not see what was uploaded.
+
+**How strong that last one is depends on the store.** The broker signs both
+`x-amz-checksum-sha256` and `Content-MD5`; MinIO and R2 enforce both, Ceph RGW
+enforces only the MD5. So on Ceph the guarantee rests on MD5 — corruption is
+caught, deliberate substitution is not. `sha256` stays the object's address
+either way. `GET /info` tells a client which digests are worth computing, and a
+client that sends only the SHA-256 gets no check at all on a store that ignores
+it.
 
 **One bounded exception**, and it is worth stating precisely rather than letting
 the rule read as absolute: proving possession reads `storage.PROOF_LENGTH` bytes
@@ -116,23 +129,15 @@ when `SPYGLASS_STORE_PUBLIC_BASE_URL` is set.
 
 `/auth/device` and `/auth/token` take no credential and spend the broker's own
 GitHub client id, so an unthrottled caller denies logins to everyone — and the
-volume quota cannot see it, because there is no account to charge.
+volume quota cannot see it, because there is no account to charge. The limits
+live in `deploy/nginx/`; `deploy/README.md` has the numbers.
 
-The limit lives in `deploy/nginx/`, and the compose file publishes that edge
-instead of the broker. The numbers come from `SPYGLASS_STORE_EDGE_*` variables
-rendered into those templates at startup, so tuning them is an `.env` edit
-rather than an nginx one — but they are *edge* settings, and deliberately absent
-from `settings.py`: the application must not appear to enforce something it
-never sees. Doing it in the application would mean telling callers
-apart by address, which behind a proxy means trusting `X-Forwarded-For` without
-knowing how many hops to trust; `guards.client_ip` records that header for audit
-and decides nothing on it. **If a rate limit ever does move into the app,
-trusted-proxy handling has to come first** — otherwise a forged header buys a
-fresh bucket per request, and the limit protects nothing while appearing to.
-
-The token endpoint's allowance is deliberately loose: the device flow polls it
-every few seconds until the user approves, so a tight limit breaks slow logins
-rather than stopping abuse. `deploy/README.md` has the numbers.
+Doing it in the application would mean telling callers apart by address, which
+behind a proxy means trusting `X-Forwarded-For` without knowing how many hops to
+trust. `guards.client_ip` records that header for audit and decides nothing on
+it. **If a rate limit ever does move into the app, trusted-proxy handling has to
+come first** — otherwise a forged header buys a fresh bucket per request, and the
+limit protects nothing while appearing to.
 
 ### Claiming stored content requires holding it
 
@@ -153,6 +158,76 @@ runs once per registration, not per read. If you find yourself widening it —
 reading more, or reading on a hot path — that is the rule being eroded rather
 than applied, and the alternative designs (re-uploading the whole file, or
 dropping cross-owner deduplication) are the ones to weigh instead.
+
+### A derivative's parent is read from Spyglass, and frozen
+
+`AnalysisNwbfile` carries a foreign key to `Nwbfile`, so the broker reads which
+raw file an analysis file came from rather than taking a client's word for it.
+Three things about that are easy to get wrong.
+
+**Read the key, not the name.** Analysis files are named after their raw —
+`SomePrefix.nwb` becomes `SomePrefix_{10 random chars}.nwb` — so the parent looks
+derivable by stripping a suffix. Any raw whose own name ends in something shaped
+like `_<10 chars>` parses to the wrong prefix, silently and permissively.
+
+**Depth is one.** That foreign key points at a *raw* file, so there is no chain
+to walk and no cycle to guard against. A result drawing on several analysis files
+is a client concern, handled there by `share_parents`.
+
+**The edge is recorded once, at registration.** Unlike `LabMember` and `LabTeam`,
+`AnalysisNwbfile` is written by ordinary users — writing an analysis file is what
+a pipeline does — so a row in it is a user's claim, not an administrator's. A
+live lookup on every read would let whoever can write that table re-point the
+provenance of a registration that already exists. `File.parent` is therefore
+written when the file is registered and never re-derived; grants are still read
+live, so changing a file's visibility still takes effect immediately.
+
+**What the parent is not yet used for.** Nothing decides anything from it today.
+Making a derivative readable by the people who can read its raw needs one more
+thing the broker does not have: a binding from a derivative to a *person* that
+that person's adversary cannot assert. Registering a `spyglass_name` is
+deliberately open — several people may declare the same file — so "whoever can
+read a registration of the parent" is forgeable by registering the parent's name
+yourself, against bytes of your own. Possession proof does not help: the attacker
+needs only the *name*. Resolving that is a policy decision, not a code change;
+until it is made, `parent` is data and diagnostics.
+
+### Visibility is declared, or inherited — never both
+
+Whether a registration *said* anything is the whole rule, and `File.inherits`
+records which it was:
+
+| Registration | Raw | Analysis |
+| --- | --- | --- |
+| no `visibility` | public | takes the raw's audience, and follows it |
+| a `visibility` | honoured exactly | honoured exactly, wider or narrower |
+
+An inherited file has no grant rows of its own; `guards._readable` consults the
+parent's, live, so re-scoping a session re-scopes every result derived from it
+with nothing re-declared. A declared file is read from its own grants alone.
+
+**`replace_rules` clears the flag**, because setting a visibility is a choice.
+Without that, narrowing a derivative would appear to work and be undone by the
+next read, which would still be consulting the raw.
+
+The asymmetry is deliberate: Spyglass derives intent across several parents and
+declares the result, while the broker only ever knows the one raw in
+`AnalysisNwbfile`. Letting a declared scope win is what keeps the two from
+disagreeing — the client's answer is the more informed one.
+
+### One raw name means one file, and the first registration keeps it
+
+Registering a **raw** name against content that disagrees with an existing
+registration of that name is refused with 409. Several accounts may register
+the same raw — that is deduplication — but not disagree about what it holds,
+because an analysis file inherits its raw's visibility *by name*, and a name
+that meant two things would be a way to inherit someone else's audience.
+
+**Several Spyglass instances may share one broker**, and `nwb_file_name` is
+unique only within an instance, so two instances can hold genuinely different
+sessions under one name. That is a naming disagreement between people, settled
+upstream by renaming and registering again — not here by letting a name mean
+two files. The refusal says so, and names the remedy.
 
 ### A Spyglass name identifies content, not a registration
 
@@ -275,8 +350,12 @@ patching modules.
 What genuinely needs infrastructure gets it:
 
 - `tests/test_db.py` — real MySQL, for anything that writes
-- `tests/test_s3_integration.py` — real MinIO, because only a real store can say
-  whether a signature it issued is one it accepts
+- `tests/test_s3_integration.py` — a real store, because only a real store can
+  say whether a signature this package issued is one it accepts. **Scoped to
+  what the package does**, not to what a store decides to refuse: tests of
+  expired signatures, tampered keys, and checksum enforcement were removed
+  because their answers vary by vendor, and a suite that goes red when the
+  backend changes is reporting on the backend rather than on the code
 - `tests/test_end_to_end.py` — both, running the whole path from registration to
   a streamed read
 

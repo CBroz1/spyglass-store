@@ -29,80 +29,68 @@
 # ---------------------------------------------------------------------------
 # ONE CONSTRAINT THAT IS EASY TO BREAK
 #
-# The broker and the object store must be reachable at DIFFERENT ORIGINS.
-#
-# `GET /file/{id}/content` answers 302 to a presigned URL. Every HTTP client
-# tested keeps its `Authorization` header when a redirect stays within one
-# origin and strips it when the origin changes. An S3 store that receives that
-# header drops out of presigned-URL mode into header authentication and then
-# refuses the request, complaining about a missing `x-amz-content-sha256` —
-# which reads nothing like an authentication problem and will cost whoever
-# debugs it an afternoon.
-#
-# Below, the two services are on different ports, which is a different origin.
-# If you put a reverse proxy in front, give them different HOSTNAMES:
-#
-#   store.example.org      -> broker          GOOD
-#   objects.example.org    -> object store
-#
-#   store.example.org/api  -> broker          BROKEN: reads fail
-#   store.example.org/obj  -> object store
-#
-# Set SPYGLASS_STORE_PUBLIC_BASE_URL and the broker will warn at startup if it
-# detects this.
+# The broker and the object store must be reachable at DIFFERENT ORIGINS —
+# different ports below, different HOSTNAMES behind a proxy. Same-origin breaks
+# every read, with an error that names a checksum rather than the real cause.
+# Set SPYGLASS_STORE_PUBLIC_BASE_URL and the broker warns at startup.
+# deploy/README.md explains why.
 # ---------------------------------------------------------------------------
 
 name: spyglass-store
 
 services:
   store:
-    # MinIO stands in for the deployed object store. Ceph RGW, SeaweedFS, and
-    # Garage are all reachable by changing this image and the endpoint below;
-    # the broker speaks only the S3 API and knows about none of them.
-    # quay.io, not Docker Hub: MinIO withdrew their images from Docker Hub, so
-    # `minio/minio` refuses anonymous pulls. Pinned to a release rather than
-    # `latest` so an upstream change cannot break a deployment you did not
-    # touch. Bump it deliberately.
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
-    command: server /data --console-address ":9001"
+    # Ceph RGW, the implementation this deployment targets. Pinned by digest:
+    # `demo` carries no release tags, and a digest cannot be re-pointed under a
+    # deployment that did not ask for it.
+    #
+    # This is a *development* store. A real deployment points
+    # SPYGLASS_STORE_S3_ENDPOINT_URL at an existing cluster and does not run
+    # this service at all — a single-node demo cluster is not somewhere to keep
+    # research data.
+    image: quay.io/ceph/demo@sha256:522483cf07cfce6386b8e18a3edfa88a1b32c688dee231d0a6962b1513557723
     restart: unless-stopped
+    # MON_IP has to be the container's own address, which is not known until it
+    # starts — so the wrapper asks from inside and hands over to the image's
+    # real entrypoint. `NETWORK_AUTO_DETECT` is documented to do this and does
+    # not work on this image.
+    entrypoint:
+      - /bin/bash
+      - -c
+      - >
+        export MON_IP=$$(hostname -i | awk '{print $$1}');
+        export CEPH_PUBLIC_NETWORK=$$(hostname -i
+        | awk '{split($$1,a,"."); print a[1]"."a[2]".0.0/16"}');
+        exec /opt/ceph-container/bin/demo
     environment:
-      MINIO_ROOT_USER: ${SPYGLASS_STORE_S3_ACCESS_KEY:?set in .env}
-      MINIO_ROOT_PASSWORD: ${SPYGLASS_STORE_S3_SECRET_KEY:?set in .env}
+      DEMO_DAEMONS: mon,osd,rgw
+      OSD_TYPE: directory
+      RGW_NAME: localhost
+      RGW_FRONTEND_PORT: "8080"
+      CEPH_DEMO_UID: broker
+      # The bucket is created by the image, which is why there is no separate
+      # job to make one. The broker still refuses to boot without it.
+      CEPH_DEMO_BUCKET: ${SPYGLASS_STORE_S3_BUCKET:-spyglass-store}
+      CEPH_DEMO_ACCESS_KEY: ${SPYGLASS_STORE_S3_ACCESS_KEY:?set in .env}
+      CEPH_DEMO_SECRET_KEY: ${SPYGLASS_STORE_S3_SECRET_KEY:?set in .env}
     volumes:
-      - objects:/data
+      - objects:/var/lib/ceph
     ports:
       # A distinct origin from the broker. See the note above. Published,
       # because clients follow presigned URLs here — the broker redirects and
       # steps out of the data path, so a store only this host can reach means
       # every download fails at the redirect.
-      - "9000:9000"
-      # Console, bound to loopback so it is reachable from this machine and
-      # nowhere else. It is an administrative interface for the credential that
-      # can write every object.
-      - "127.0.0.1:9001:9001"
+      - "9000:8080"
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
+      # RGW has no liveness endpoint, so the S3 API itself is the probe.
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8080/"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      # A single-node cluster takes a while to reach a serving state.
+      start_period: 120s
 
-  # One-shot: the broker verifies the bucket at startup and refuses to boot
-  # without it. It deliberately does not create buckets itself — provisioning
-  # storage is an operator action, not something a web service should do with
-  # the credential it holds.
-  createbucket:
-    image: quay.io/minio/mc:latest
-    # Explicit: this one exits 0 by design, and restarting it forever would
-    # leave `docker compose ps` looking permanently unhealthy.
-    restart: "no"
-    depends_on:
-      store:
-        condition: service_healthy
-    environment:
-      MC_HOST_local: http://${SPYGLASS_STORE_S3_ACCESS_KEY}:${SPYGLASS_STORE_S3_SECRET_KEY}@store:9000
-    entrypoint: >
-      sh -c "mc mb --ignore-existing local/${SPYGLASS_STORE_S3_BUCKET:-spyglass-store}"
+
 
   broker:
     build:
@@ -111,8 +99,6 @@ services:
     depends_on:
       store:
         condition: service_healthy
-      createbucket:
-        condition: service_completed_successfully
     # Everything in `.env` reaches the broker, so every setting in
     # `settings.py` is reachable without being listed twice. The variables named
     # below are the ones this file needs for itself — a required check, a
@@ -137,11 +123,11 @@ services:
 
       # Object store. `store` is the service name on the compose network, so
       # this is a different origin from whatever the broker is published at.
-      SPYGLASS_STORE_S3_ENDPOINT_URL: ${SPYGLASS_STORE_S3_ENDPOINT_URL:-http://store:9000}
+      SPYGLASS_STORE_S3_ENDPOINT_URL: ${SPYGLASS_STORE_S3_ENDPOINT_URL:-http://store:8080}
       SPYGLASS_STORE_S3_BUCKET: ${SPYGLASS_STORE_S3_BUCKET:-spyglass-store}
       SPYGLASS_STORE_S3_ACCESS_KEY: ${SPYGLASS_STORE_S3_ACCESS_KEY:?}
       SPYGLASS_STORE_S3_SECRET_KEY: ${SPYGLASS_STORE_S3_SECRET_KEY:?}
-      SPYGLASS_STORE_S3_REGION: ${SPYGLASS_STORE_S3_REGION:-us-east-1}
+      SPYGLASS_STORE_S3_REGION: ${SPYGLASS_STORE_S3_REGION:-default}
 
       # Used only for the same-origin warning described above.
       SPYGLASS_STORE_PUBLIC_BASE_URL: ${SPYGLASS_STORE_PUBLIC_BASE_URL:-}
