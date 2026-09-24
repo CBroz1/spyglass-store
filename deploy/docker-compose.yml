@@ -1,11 +1,30 @@
 # Single-node broker, with a self-hosted object store alongside it.
 #
-# Copy `.env.example` to `.env` at the repository root and fill it in, then:
-#
+#   cp deploy/env.example deploy/.env      # then fill it in
 #   docker compose -f deploy/docker-compose.yml up --build
+#
+# **`.env` has to sit next to this file.** Compose reads it from the compose
+# file's own directory, not from wherever you happen to be standing, so a `.env`
+# at the repository root is silently ignored and required variables turn up
+# missing. If you keep one there anyway, name it explicitly:
+#
+#   docker compose --env-file .env -f deploy/docker-compose.yml up --build
 #
 # The broker refuses to start if it cannot reach its bucket or the Spyglass
 # lab schema, so a container that comes up is one whose configuration works.
+#
+# ---------------------------------------------------------------------------
+# THIS FILE SERVES PLAIN HTTP
+#
+# Fine where TLS is terminated in front of it — then set
+# SPYGLASS_STORE_EDGE_TRUSTED_PROXY to that hop's address, or the rate limits
+# lump every caller into one bucket. If nothing else terminates TLS, add the
+# override, which publishes 80 and 443 instead of 8000:
+#
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.tls.yml up
+#
+# Bearer tokens and presigned URLs both travel in the clear otherwise.
+# ---------------------------------------------------------------------------
 #
 # ---------------------------------------------------------------------------
 # ONE CONSTRAINT THAT IS EASY TO BREAK
@@ -46,15 +65,22 @@ services:
     # touch. Bump it deliberately.
     image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     command: server /data --console-address ":9001"
+    restart: unless-stopped
     environment:
       MINIO_ROOT_USER: ${SPYGLASS_STORE_S3_ACCESS_KEY:?set in .env}
       MINIO_ROOT_PASSWORD: ${SPYGLASS_STORE_S3_SECRET_KEY:?set in .env}
     volumes:
       - objects:/data
     ports:
-      # A distinct origin from the broker. See the note above.
+      # A distinct origin from the broker. See the note above. Published,
+      # because clients follow presigned URLs here — the broker redirects and
+      # steps out of the data path, so a store only this host can reach means
+      # every download fails at the redirect.
       - "9000:9000"
-      - "9001:9001"   # console; do not expose this publicly
+      # Console, bound to loopback so it is reachable from this machine and
+      # nowhere else. It is an administrative interface for the credential that
+      # can write every object.
+      - "127.0.0.1:9001:9001"
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 5s
@@ -67,6 +93,9 @@ services:
   # the credential it holds.
   createbucket:
     image: quay.io/minio/mc:latest
+    # Explicit: this one exits 0 by design, and restarting it forever would
+    # leave `docker compose ps` looking permanently unhealthy.
+    restart: "no"
     depends_on:
       store:
         condition: service_healthy
@@ -84,6 +113,17 @@ services:
         condition: service_healthy
       createbucket:
         condition: service_completed_successfully
+    # Everything in `.env` reaches the broker, so every setting in
+    # `settings.py` is reachable without being listed twice. The variables named
+    # below are the ones this file needs for itself — a required check, a
+    # default that points at the compose network — and `environment` wins over
+    # `env_file`, so naming one here does not stop `.env` from setting it.
+    #
+    # Deliberately not done for the edge: it would hand the database password
+    # and the object-store credentials to a container that needs neither.
+    env_file:
+      - path: .env
+        required: false
     environment:
       # Database: DataJoint's own variables, not broker settings. The broker
       # deliberately does not re-declare these — an admin who can already
@@ -97,7 +137,7 @@ services:
 
       # Object store. `store` is the service name on the compose network, so
       # this is a different origin from whatever the broker is published at.
-      SPYGLASS_STORE_S3_ENDPOINT_URL: http://store:9000
+      SPYGLASS_STORE_S3_ENDPOINT_URL: ${SPYGLASS_STORE_S3_ENDPOINT_URL:-http://store:9000}
       SPYGLASS_STORE_S3_BUCKET: ${SPYGLASS_STORE_S3_BUCKET:-spyglass-store}
       SPYGLASS_STORE_S3_ACCESS_KEY: ${SPYGLASS_STORE_S3_ACCESS_KEY:?}
       SPYGLASS_STORE_S3_SECRET_KEY: ${SPYGLASS_STORE_S3_SECRET_KEY:?}
@@ -115,20 +155,67 @@ services:
     # than opening a port here.
     expose:
       - "8000"
+    restart: unless-stopped
+    # The edge waits on this, so it has to mean something. Startup already
+    # verifies the bucket and the lab schema; this only asks whether the process
+    # is still serving. `python -c` rather than curl because the image carries
+    # no HTTP client — see deploy/Dockerfile on why it carries as little as
+    # possible.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import urllib.request, sys
+          sys.exit(0 if urllib.request.urlopen(
+              "http://127.0.0.1:8000/healthz", timeout=3
+          ).status == 200 else 1)
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      # Generous: the first request opens a MySQL connection and reflects the
+      # Spyglass lab schema. A tighter window restarts a broker that was only
+      # still starting.
+      start_period: 60s
+    # Unbounded container logs are a way to fill a disk without deploying
+    # anything. Every refusal is in `AccessLog` regardless; this is stdout.
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
 
   # The rate limiter, and the only reason this deployment has a proxy at all.
   # `/auth/device` and `/auth/token` take no credential and spend the broker's
   # own GitHub client id, so they need a ceiling — and the hop that knows the
-  # caller's address is the one that can enforce one. See nginx.conf.template.
+  # caller's address is the one that can enforce one. See nginx/.
   edge:
     image: nginx:1.27-alpine
+    restart: unless-stopped
     depends_on:
-      - broker
+      # Not just "started": nginx resolves its upstream when it loads its
+      # configuration, so an edge that comes up first answers 502 until
+      # something restarts it.
+      broker:
+        condition: service_healthy
     volumes:
-      # A template, not a config: the image renders anything under
+      # Templates, not configs: the image renders anything under
       # /etc/nginx/templates through envsubst at startup, which is what makes
-      # the limits below settable from `.env`.
-      - ./nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
+      # the limits settable from `.env`. Mounted file by file rather than as a
+      # directory, so that `docker-compose.tls.yml` can add the TLS front door
+      # without this file having to know about it.
+      #
+      # `proxy.inc` is the shared server body, and it renders to a name that
+      # nginx's `conf.d/*.conf` glob does not match — it is included by a front
+      # door, never loaded on its own.
+      - ./nginx/limits.conf.template:/etc/nginx/templates/limits.conf.template:ro
+      - ./nginx/proxy.inc.template:/etc/nginx/templates/proxy.inc.template:ro
+      # Mounted as `default.conf.template` so the rendered output lands on the
+      # image's own stock `default.conf` and replaces it. Left in place, that
+      # file serves an nginx welcome page on port 80 — harmless here, where
+      # nothing publishes 80, and not harmless once the TLS overlay does.
+      - ./nginx/http.conf.template:/etc/nginx/templates/default.conf.template:ro
     environment:
       # Substitute only our own variables. Without this filter envsubst is
       # handed every name in the environment, and nginx's configuration is full
@@ -156,6 +243,24 @@ services:
 
       # Seconds, sent as `Retry-After` on a throttled response.
       SPYGLASS_STORE_EDGE_RETRY_AFTER: ${SPYGLASS_STORE_EDGE_RETRY_AFTER:-60}
+
+      # The address of the proxy in front of this one, if there is one, so the
+      # limits key on the real caller rather than on that proxy. Name it
+      # exactly; the default trusts nothing, and a wide range lets a caller
+      # choose their own bucket by forging `X-Forwarded-For`.
+      SPYGLASS_STORE_EDGE_TRUSTED_PROXY: ${SPYGLASS_STORE_EDGE_TRUSTED_PROXY:-127.0.0.1}
+    healthcheck:
+      # Against the plain listener, which exists in both the HTTP and the TLS
+      # deployment — so this check does not change when TLS is added.
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8000/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
     ports:
       # The broker's public port, now served by the edge. A distinct origin
       # from the object store above; see the note at the top of this file.

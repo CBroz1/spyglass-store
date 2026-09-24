@@ -22,9 +22,17 @@ all notable changes to this project.
 - Rate limit on the unauthenticated login endpoints, at an nginx edge that
     publishes the broker; they spend the deployment's shared GitHub client id,
     so an unthrottled caller could deny logins to everyone #1
-- Those limits are set from `SPYGLASS_STORE_EDGE_*` in `.env`, rendered into
-    `deploy/nginx.conf.template` at startup, so tuning them needs no nginx
+- Those limits are set from `SPYGLASS_STORE_EDGE_*` in `.env`, rendered into the
+    templates in `deploy/nginx/` at startup, so tuning them needs no nginx
     knowledge #1
+- TLS at the edge, as `deploy/docker-compose.tls.yml`: publishes 443 in place of
+    the plain port, redirects 80 with a 308, and sends HSTS over TLS only.
+    Bearer tokens and presigned URLs are what it keeps off the wire #1
+- `deploy/env.example`, listing every variable with its default. The broker now
+    reads the whole file, so settings like the volume allowances and the
+    account-age floor are reachable without compose enumerating them #1
+- Compose hardening: restart policies, a broker health check the edge waits on,
+    bounded container logs, and the object store's console bound to loopback #1
 
 ### Changed
 

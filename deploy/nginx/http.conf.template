@@ -1,0 +1,22 @@
+# The plain-HTTP front door. Mounted by `docker-compose.yml` always.
+#
+# Correct on its own only where TLS is terminated in front of this container —
+# an institutional reverse proxy, a load balancer, a cluster ingress. **Name
+# that hop in `SPYGLASS_STORE_EDGE_TRUSTED_PROXY`**, or the rate limits key on
+# its address and every user shares one bucket.
+#
+# If nothing else terminates TLS, this is not enough: broker tokens travel in
+# `Authorization` headers and a presigned URL carries its signature in the query
+# string, so both are readable on the wire and replayable for the life of the
+# presign. Add `docker-compose.tls.yml` — see deploy/README.md.
+#
+# In a TLS deployment this listener stays, unpublished, on the compose network.
+# It is what the container's own health check talks to.
+
+server {
+    listen 8000;
+    listen [::]:8000;
+    server_name _;
+
+    include /etc/nginx/conf.d/proxy.inc;
+}

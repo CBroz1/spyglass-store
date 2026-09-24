@@ -54,17 +54,41 @@ SPYGLASS_STORE_S3_BUCKET=spyglass-store
 ## Single node with docker compose
 
 ```sh
-cp .env.example .env     # at the repository root, then fill it in
+cp deploy/env.example deploy/.env    # then fill it in
 docker compose -f deploy/docker-compose.yml up --build
 ```
+
+**`.env` goes next to the compose file, not at the repository root.** Compose
+reads it from the compose file's own directory rather than from wherever you are
+standing, so a copy at the root is silently ignored and the required variables
+turn up missing. If you keep one there anyway, name it:
+
+```sh
+docker compose --env-file .env -f deploy/docker-compose.yml up --build
+```
+
+`deploy/env.example` lists every variable with its default, including the ones
+the broker reads directly — the whole file is passed through to it, so anything
+in `settings.py` is settable without this compose file having to mention it.
+The example is named `env.example` rather than `.env.example` because
+`.gitignore` ignores `*.env*`, and an example nobody can commit is not one.
+
+`DJ_HOST`, `DJ_USER`, and `DJ_PASS` have to be in there even though your shell
+already has a DataJoint configuration: the container cannot read your
+`~/.datajoint_config.json`.
 
 Four services: the object store, a one-shot job that creates the bucket, the
 broker, and an nginx edge that publishes it. The broker waits for the bucket to
 exist, because it verifies storage at startup and will otherwise refuse to
-boot.
+boot, and the edge waits for the broker to report healthy — nginx resolves its
+upstream when it loads its configuration, so an edge that starts first answers
+502 until something restarts it.
 
 The broker itself is not published to the host. The edge is the front door, and
 it is where the login endpoints are rate limited — see below.
+
+**The edge serves plain HTTP as configured.** That is correct only where TLS is
+terminated in front of it; otherwise add the TLS overlay, described below.
 
 The broker does not create the bucket itself. Provisioning storage is an
 operator action; a web service holding the only write credential should not
@@ -73,6 +97,36 @@ also be able to make new places to write.
 Database configuration is DataJoint's own `DJ_HOST`, `DJ_USER`, `DJ_PASS`
 rather than broker settings, so an admin who can already reach the ServerHost
 instance needs nothing new.
+
+### Surviving a reboot
+
+The three long-running services are `restart: unless-stopped`, so a broker that
+dies on a transient fault comes back on its own. The bucket-creation job is
+`restart: "no"` — it exits 0 by design, and restarting it forever would leave
+`docker compose ps` looking permanently unhealthy.
+
+**A restart policy does nothing if the Docker daemon itself does not start at
+boot.** On a host that has never had it enabled, every container stays down
+after a reboot and the policy above gives no hint that anything is wrong:
+
+```sh
+sudo systemctl enable --now docker
+systemctl is-enabled docker      # expect: enabled
+```
+
+`unless-stopped` rather than `always` is deliberate: a container you stopped by
+hand stays stopped across a daemon restart, so taking the broker down for
+maintenance does not fight you. The cost is that "stopped" is remembered — after
+deliberately stopping something, bring it back explicitly.
+
+Worth confirming once, on the real host, rather than discovering it after an
+unplanned reboot:
+
+```sh
+sudo reboot
+# then, once it is back
+docker compose -f deploy/docker-compose.yml ps
+```
 
 ### The one constraint that is easy to break
 
@@ -97,6 +151,60 @@ The second is the natural thing to reach for on a single host, which is why it
 is worth stating. Set `SPYGLASS_STORE_PUBLIC_BASE_URL` to the broker's public
 URL and it will warn at startup if it detects the collision.
 
+## Serving HTTPS
+
+A broker token is a bearer credential sent on every request, and a presigned URL
+carries its signature in the query string. Over plain HTTP both are readable by
+anything on the path, and the presign is replayable until it expires. So one of
+these two has to be true:
+
+**Something in front terminates TLS** — an institutional reverse proxy, a load
+balancer, a cluster ingress. Then the base compose file is right as it stands,
+and the one thing to add is `SPYGLASS_STORE_EDGE_TRUSTED_PROXY`, set to that
+hop's address. Without it the rate limits key on the proxy and every caller
+shares one bucket.
+
+**Or the edge terminates it**, with the overlay:
+
+```sh
+docker compose -f deploy/docker-compose.yml \
+               -f deploy/docker-compose.tls.yml up --build
+```
+
+That publishes 80 and 443 instead of 8000, and needs a certificate you supply:
+
+| Variable | Meaning |
+| --- | --- |
+| `SPYGLASS_STORE_EDGE_SERVER_NAME` | the hostname the certificate is for |
+| `SPYGLASS_STORE_EDGE_TLS_DIR` | directory **on this host**, mounted read-only |
+| `SPYGLASS_STORE_EDGE_TLS_CERT` | path **inside the container** to the full chain |
+| `SPYGLASS_STORE_EDGE_TLS_KEY` | path inside the container to the private key |
+
+A directory rather than two host paths, because a certificate is usually a
+symlink into a renewal directory and mounting the directory keeps that working.
+There is deliberately no ACME client: an institutional certificate is the common
+case, and a service that renews its own needs outbound reachability and a
+writable volume this container otherwise does without.
+
+Port 80 answers 308 to the HTTPS URL — 308 rather than 301 because both login
+endpoints are POSTs and the weaker codes let a client turn a POST into a GET.
+Responses carry HSTS for a year, over TLS only.
+
+**After a renewal, reload:** `docker compose ... exec edge nginx -s reload`.
+nginx reads certificates once, at startup, so a renewed file on disk changes
+nothing until it does.
+
+### The object store needs its own TLS
+
+Terminating TLS at the broker is not the whole job. The broker redirects to the
+object store and steps out, so the transfer itself — and the signature in that
+URL — is only as protected as the store's own endpoint. An `https://` broker
+handing out `http://` presigned URLs puts every byte and every signature back in
+the clear.
+
+That is the store's configuration, not this one's. It is also why the two must be
+different hostnames rather than one: see the constraint above.
+
 ## Rate limiting the login endpoints
 
 `/auth/device` and `/auth/token` are the only routes that take no credential,
@@ -104,14 +212,14 @@ and they proxy to GitHub on the broker's own client id. Left open, one caller
 exhausts the app's GitHub rate limit and nobody can log in — no account needed,
 and the broker's own quota never sees it because there is no account to charge.
 
-`deploy/nginx.conf.template` limits them, and `docker-compose.yml` publishes
-that edge instead of the broker. **Publishing the broker's port alongside it
+`deploy/nginx/` holds the limits and `docker-compose.yml` publishes that edge
+instead of the broker. **Publishing the broker's port alongside it
 defeats the whole arrangement**, so if you replace this proxy with your own,
 keep the broker unpublished.
 
 ### Tuning the limits
 
-Set them in `.env` with everything else. The nginx image renders the template
+Set them in `.env` with everything else. The nginx image renders the templates
 through `envsubst` at startup, so no one has to edit nginx syntax to change a
 number, and `docker compose up` works with none of these set.
 
@@ -124,6 +232,7 @@ number, and `docker compose up` works with none of these set.
 | `SPYGLASS_STORE_EDGE_TOTAL_RATE` | `240r/m` | both routes, all callers together |
 | `SPYGLASS_STORE_EDGE_TOTAL_BURST` | `40` | how many may arrive at once |
 | `SPYGLASS_STORE_EDGE_RETRY_AFTER` | `60` | seconds sent on a 429 |
+| `SPYGLASS_STORE_EDGE_TRUSTED_PROXY` | `127.0.0.1` | whose `X-Forwarded-For` to believe |
 
 `r/m` is nginx's own spelling; `r/s` works too. A rate is the sustained
 allowance and a burst is how far a client may run ahead of it — **raise a rate
@@ -153,12 +262,32 @@ per account by the broker's volume quota, and a request-rate limit on top would
 throttle the workload this service exists for — a streamed read re-follows the
 content redirect once per range request, which looks exactly like a flood.
 
+### What is in `deploy/nginx/`
+
+| File | Holds |
+| --- | --- |
+| `limits.conf.template` | the rate-limit zones, and the upstream |
+| `proxy.inc.template` | the shared server body: headers, the limits applied, the three locations |
+| `http.conf.template` | the plain-HTTP front door |
+| `tls.conf.template` | the TLS front door, used only by the overlay |
+
+The two front doors include the same body, so the limits exist once. A second
+copy would eventually disagree with the first, and the copy that lost would be
+the one someone was relying on.
+
+`proxy.inc` renders to a name nginx's `conf.d/*.conf` glob does not match, which
+is what keeps it an include rather than a config in its own right.
+
 ### If something else sits in front
 
 A CDN, a load balancer, or a cluster ingress makes every request arrive from
-one address, so all callers share a single bucket. Uncomment `set_real_ip_from`
-in `nginx.conf.template` and name that hop **exactly**; a wide range there lets
-a caller choose their own bucket by forging `X-Forwarded-For`.
+one address, so all callers share a single bucket — the limit then throttles
+everybody or nobody. Set `SPYGLASS_STORE_EDGE_TRUSTED_PROXY` to that hop's
+address and nginx takes the caller from `X-Forwarded-For` instead.
+
+Name it **exactly**. The default, `127.0.0.1`, trusts nothing and is a harmless
+no-op for a directly exposed edge. A wide range lets a caller choose their own
+bucket by forging the header.
 
 That is also why the broker does not do this itself. Behind a proxy it sees
 only the proxy, so it would have to trust a caller-supplied header without

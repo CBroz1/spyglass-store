@@ -1,0 +1,54 @@
+# TLS termination at the edge. An overlay, not a replacement:
+#
+#   docker compose -f deploy/docker-compose.yml \
+#                  -f deploy/docker-compose.tls.yml up --build
+#
+# Compose merges the two, so everything in the base file still applies and this
+# one only adds the TLS front door and swaps which ports are published.
+#
+# WHY YOU WANT THIS
+#
+# A broker token is a bearer credential sent on every request, and a presigned
+# URL carries its signature in the query string. Over plain HTTP both are
+# readable in transit and the presign is replayable until it expires. Use this,
+# or terminate TLS in a proxy in front of the edge and set
+# SPYGLASS_STORE_EDGE_TRUSTED_PROXY to that proxy's address.
+#
+# WHAT YOU HAVE TO SUPPLY
+#
+# A certificate and key on this host, and the hostname they are issued for:
+#
+#   SPYGLASS_STORE_EDGE_SERVER_NAME=store.example.org
+#   SPYGLASS_STORE_EDGE_TLS_DIR=/etc/ssl/spyglass-store
+#   SPYGLASS_STORE_EDGE_TLS_CERT=/etc/nginx/tls/fullchain.pem
+#   SPYGLASS_STORE_EDGE_TLS_KEY=/etc/nginx/tls/privkey.pem
+#
+# `_TLS_DIR` is the directory on the host; the `_CERT` and `_KEY` paths are
+# inside the container, under the read-only /etc/nginx/tls mount below. Two
+# variables rather than one because a certificate is usually a symlink into a
+# renewal directory, and mounting the directory keeps that working.
+#
+# The hostname matters twice: the certificate has to match it, and it has to
+# differ from the object store's hostname. Serving both under one name breaks
+# every read — see the note at the top of the base file.
+#
+# After a renewal, `docker compose ... exec edge nginx -s reload`. nginx reads
+# certificates once, at startup.
+
+services:
+  edge:
+    volumes:
+      - ./nginx/tls.conf.template:/etc/nginx/templates/tls.conf.template:ro
+      - ${SPYGLASS_STORE_EDGE_TLS_DIR:?the host directory holding the certificate}:/etc/nginx/tls:ro
+    environment:
+      SPYGLASS_STORE_EDGE_SERVER_NAME: ${SPYGLASS_STORE_EDGE_SERVER_NAME:?the hostname the certificate is for}
+      SPYGLASS_STORE_EDGE_TLS_CERT: ${SPYGLASS_STORE_EDGE_TLS_CERT:-/etc/nginx/tls/fullchain.pem}
+      SPYGLASS_STORE_EDGE_TLS_KEY: ${SPYGLASS_STORE_EDGE_TLS_KEY:-/etc/nginx/tls/privkey.pem}
+    # `!override` because compose *appends* port lists when it merges. Without
+    # it the base file's 8000 stays published beside these, which would leave a
+    # plain-HTTP front door open next to the TLS one — every token on it in the
+    # clear, and nothing to suggest anything was wrong. The container still
+    # listens on 8000 internally; that is what the health check talks to.
+    ports: !override
+      - "80:80"
+      - "443:443"

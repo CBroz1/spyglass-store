@@ -118,12 +118,12 @@ when `SPYGLASS_STORE_PUBLIC_BASE_URL` is set.
 GitHub client id, so an unthrottled caller denies logins to everyone — and the
 volume quota cannot see it, because there is no account to charge.
 
-The limit lives in `deploy/nginx.conf.template`, and the compose file publishes
-that edge instead of the broker. The numbers come from `SPYGLASS_STORE_EDGE_*`
-variables rendered into the template at startup, so tuning them is an `.env`
-edit rather than an nginx one — but they are *edge* settings, and deliberately
-absent from `settings.py`: the application must not appear to enforce something
-it never sees. Doing it in the application would mean telling callers
+The limit lives in `deploy/nginx/`, and the compose file publishes that edge
+instead of the broker. The numbers come from `SPYGLASS_STORE_EDGE_*` variables
+rendered into those templates at startup, so tuning them is an `.env` edit
+rather than an nginx one — but they are *edge* settings, and deliberately absent
+from `settings.py`: the application must not appear to enforce something it
+never sees. Doing it in the application would mean telling callers
 apart by address, which behind a proxy means trusting `X-Forwarded-For` without
 knowing how many hops to trust; `guards.client_ip` records that header for audit
 and decides nothing on it. **If a rate limit ever does move into the app,

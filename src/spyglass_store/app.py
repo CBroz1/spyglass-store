@@ -37,8 +37,12 @@ unthrottled caller can exhaust the app's GitHub rate limit and deny logins to
 everyone. Doing it here would mean trusting `X-Forwarded-For` to tell one
 caller from another, which behind a proxy requires a trusted-hop count the
 broker does not have — `client_ip` is deliberately audit-only. The limits live
-in `deploy/nginx.conf.template`, tunable from the deployment's `.env`, and
-there is nothing in `settings.py` to match them on purpose.
+in `deploy/nginx/`, tunable from the deployment's `.env`, and there is nothing
+in `settings.py` to match them on purpose.
+
+Transport security is the edge's job for the same reason: this application is
+served over plain HTTP inside the deployment, and what keeps a bearer token off
+the wire is TLS terminated in front of it. See `deploy/README.md`.
 """
 
 from __future__ import annotations

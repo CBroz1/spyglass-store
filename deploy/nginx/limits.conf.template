@@ -1,0 +1,65 @@
+# The rate-limit zones, and the only reason this deployment has a proxy at all.
+#
+# WHY HERE AND NOT IN THE APPLICATION
+#
+# `/auth/device` and `/auth/token` take no credential and proxy to GitHub on the
+# broker's own client id, so an unthrottled caller exhausts the app's GitHub
+# rate limit and denies logins to everyone — no account required, and the
+# broker's own quota never sees it because there is no account to charge.
+#
+# Limiting per caller means identifying callers by address, and behind a proxy
+# the broker only sees the proxy. It would have to trust `X-Forwarded-For`,
+# which is caller-supplied: without a count of trusted hops, anyone can prepend
+# a fake address and get a fresh bucket per request. The broker records that
+# header for audit and decides nothing on it (`guards.client_ip`), and the fix
+# is not to start trusting it in the application — it is to limit at the hop
+# that knows the peer address. That is here.
+#
+# This file holds what belongs to nginx's `http` context: the zones themselves.
+# Where they are applied is `proxy.inc.template`, which both front doors share.
+
+# One bucket per caller per endpoint. 10m holds ~160k addresses; nginx evicts
+# the least recently used when it fills.
+#
+# Starting a login is a human action, and a rare one.
+limit_req_zone $binary_remote_addr zone=auth_start:10m rate=${SPYGLASS_STORE_EDGE_DEVICE_RATE};
+
+# Polling is not. GitHub's device flow has the client poll the token endpoint
+# every `interval` seconds — 5 by default — for as long as the user takes to
+# approve, so an honest client sustains 12r/m here for up to fifteen minutes.
+# A limit tight enough to feel safe would break every slow login.
+limit_req_zone $binary_remote_addr zone=auth_poll:10m rate=${SPYGLASS_STORE_EDGE_POLL_RATE};
+
+# Per-address limits do nothing against a spread-out flood, and the asset being
+# protected is shared: one GitHub rate limit for the whole deployment. So there
+# is also a ceiling across all callers. At the poll rate above this is roughly
+# twenty simultaneous logins; raise it for a larger deployment, and know that
+# what you are raising is how much of the app's GitHub budget one flood can
+# spend.
+limit_req_zone $server_name zone=auth_total:1m rate=${SPYGLASS_STORE_EDGE_TOTAL_RATE};
+
+# 429 rather than nginx's default 503: the contract in `openapi.yaml` documents
+# 429 with `Retry-After` for throttling, and 503 tells a client to retry a
+# service that is not actually down.
+limit_req_status 429;
+limit_req_log_level warn;
+
+upstream broker {
+    # The compose service name. The broker is not published to the host — if it
+    # were, every limit here could be skipped by addressing it directly.
+    server broker:8000;
+}
+
+# HSTS, but only where it means anything. `add_header` with an empty value emits
+# nothing, so this one line covers both front doors: the header appears over
+# TLS and is silently skipped on the plain listener, where a browser would
+# ignore it anyway.
+#
+# It has to be applied per location rather than once per server, because nginx
+# does not inherit `add_header` into a location that sets any of its own — and
+# the two rate-limited locations each set `Retry-After`. Inheritance would
+# silently drop HSTS from exactly the endpoints a client talks to first.
+map $scheme $hsts_header {
+    https   "max-age=31536000";
+    default "";
+}
