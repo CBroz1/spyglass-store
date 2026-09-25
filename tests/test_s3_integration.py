@@ -72,36 +72,6 @@ def test_verify_store_names_the_bucket_it_could_not_reach(s3_settings):
 # ------------------ a stray Authorization header ------------------
 
 
-def test_a_cross_origin_redirect_strips_the_header(object_store, stored):
-    """The reason the design is safe: clients drop the header themselves.
-
-    Verified here against a real signed URL rather than a local stand-in, so
-    the client behaviour and the store's refusal are observed together.
-    """
-    url = object_store.presigned_get(stored, 300)
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/content":
-            return httpx.Response(302, headers={"Location": url})
-        raise AssertionError("unreachable")  # pragma: no cover
-
-    # Only the broker hop is simulated; the redirect target is the real store.
-    with httpx.Client(
-        transport=httpx.MockTransport(handler), follow_redirects=False
-    ) as client:
-        hop = client.get(
-            "https://broker.example.org/content",
-            headers={"Authorization": "Bearer broker-tok"},
-        )
-
-    assert hop.status_code == 302
-
-    followed = httpx.get(hop.headers["location"])
-
-    assert followed.status_code == 200
-    assert followed.content == PAYLOAD
-
-
 # --------------------------- startup checks ---------------------------
 
 

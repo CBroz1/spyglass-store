@@ -46,6 +46,9 @@ def test_object_store_protocol_is_structural() -> None:
     """
 
     class Fake:
+        def verify_store(self) -> None:
+            return None
+
         def exists(self, key: str) -> bool:
             return False
 
@@ -74,3 +77,68 @@ def test_same_origin_compares_scheme_host_and_port():
     assert not same_origin("https://a.org:443", "https://a.org:9000")
     # An unset public_base_url cannot be compared, so it must not match.
     assert not same_origin("", "https://a.org")
+
+
+def test_a_client_strips_credentials_across_origins():
+    """The invariant the whole redirect design rests on.
+
+    Both hops go through one client, and both are recorded, so this asserts
+    what the *second request actually carried* rather than what a fresh request
+    happens to look like. If a client ever forwarded the header across origins,
+    the object store would receive a broker token and refuse the read — which
+    is why the two must be different origins.
+    """
+    import httpx
+
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.host == "broker.example.org":
+            return httpx.Response(
+                302,
+                headers={"Location": "https://objects.example.org/o/x?sig=a"},
+            )
+        return httpx.Response(200, content=b"bytes")
+
+    with httpx.Client(
+        transport=httpx.MockTransport(handler), follow_redirects=True
+    ) as client:
+        response = client.get(
+            "https://broker.example.org/content",
+            headers={"Authorization": "Bearer broker-tok"},
+        )
+
+    assert response.status_code == 200
+    assert len(seen) == 2, "the redirect was not followed"
+    assert "authorization" in {k.lower() for k in seen[0].headers}
+    assert "authorization" not in {k.lower() for k in seen[1].headers}
+
+
+def test_a_client_keeps_credentials_within_one_origin():
+    """The other half, and the reason the constraint is not optional.
+
+    Serve the broker and the store under one hostname and the token rides along
+    to the store, which refuses the request with a complaint about a checksum.
+    """
+    import httpx
+
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path == "/content":
+            return httpx.Response(
+                302, headers={"Location": "https://one.example.org/o/x?sig=a"}
+            )
+        return httpx.Response(200, content=b"bytes")
+
+    with httpx.Client(
+        transport=httpx.MockTransport(handler), follow_redirects=True
+    ) as client:
+        client.get(
+            "https://one.example.org/content",
+            headers={"Authorization": "Bearer broker-tok"},
+        )
+
+    assert "authorization" in {k.lower() for k in seen[1].headers}

@@ -8,6 +8,7 @@ seam between that logic and MySQL.
 
 from __future__ import annotations
 
+import re
 from datetime import timedelta
 
 import pytest
@@ -997,9 +998,12 @@ def test_an_ambiguous_github_login_is_flagged(db, lab_tables, caplog):
     """One GitHub login must map to at most one lab member.
 
     Upstream should enforce this with a unique index. If it does not, picking
-    a row silently would hand one person another's teams, so the ambiguity is
-    logged. The lookup still returns a member rather than refusing the login,
-    since the user cannot fix an administrative mistake by retrying.
+    a row would hand one person another's teams and tier on the strength of
+    database ordering — so the lookup answers None, the same as an unlinked
+    login, and says why in the log.
+
+    Nobody is locked out: they still log in, as an unaffiliated reader with
+    public files only, until an admin removes the duplicate.
     """
     import logging
 
@@ -1017,7 +1021,7 @@ def test_an_ambiguous_github_login_is_flagged(db, lab_tables, caplog):
     with caplog.at_level(logging.WARNING):
         member = lab_member_for_github("shared")
 
-    assert member is not None
+    assert member is None, "ambiguity must not resolve to a row's access"
     assert "recorded against 2 lab members" in caplog.text
     assert "unique index" in caplog.text
 
@@ -1538,6 +1542,7 @@ def test_a_clashing_raw_registration_is_refused_over_http(
         "size_bytes": 10,
         "spyglass_name": "overhttp_.nwb",
         "file_class": "raw",
+        "content_md5": "f" * 32,
     }
 
     first = client.post(
@@ -1597,6 +1602,7 @@ def test_an_upload_that_declares_nothing_is_public(
             "size_bytes": 10,
             "spyglass_name": "bydefault_.nwb",
             "file_class": "raw",
+            "content_md5": "f" * 32,
         },
         headers={"Authorization": f"Bearer {registry.issue_token(uploader)}"},
     )
@@ -1830,6 +1836,7 @@ def test_an_undeclared_raw_is_public_over_http(db, uploader, nwbfile_tables):
             "size_bytes": 10,
             "spyglass_name": "undeclared_.nwb",
             "file_class": "raw",
+            "content_md5": "f" * 32,
         },
         headers={"Authorization": f"Bearer {registry.issue_token(uploader)}"},
     )
@@ -1838,3 +1845,220 @@ def test_an_undeclared_raw_is_public_over_http(db, uploader, nwbfile_tables):
     rules = registry.rules_for_file(r.json()["file_id"])
 
     assert [rule.principal_type for rule in rules] == [Principal.PUBLIC]
+
+
+def test_the_tier_vocabulary_matches_the_declared_table(db, broker_tables):
+    """Two declarations of one vocabulary, and only this keeps them in step.
+
+    DataJoint spells its enum as a string and cannot import `Tier`, so a fifth
+    tier added in one place and not the other would fail at an insert, in
+    production, on whoever was promoted. Read from the *table* rather than from
+    a copy of the definition: comparing the enum to a string pasted into this
+    file would stay green through exactly the drift it is meant to catch.
+    """
+    from spyglass_store.access import Tier
+
+    Account, _, _ = broker_tables
+    declared = Account.heading.attributes["tier"].type
+
+    assert set(re.findall(r"'([^']+)'", declared)) == {t.value for t in Tier}
+
+
+# ------------- inheritance: what may count as "the raw" -------------
+
+
+def test_an_analysis_file_sharing_the_raws_name_grants_nothing(
+    db, uploader, nwbfile_tables
+):
+    """Analysis names are not content-gated, so anyone may register one.
+
+    Without restricting the parent lookup to *raw* registrations, registering
+    an analysis file under the raw's name and declaring it public would hand
+    out every derivative of that raw.
+    """
+    from spyglass_store import registry
+    from spyglass_store.access import Scope, rules_for
+
+    _declare_lineage(nwbfile_tables, "guard_.nwb", "guard_ABCDEFGHIJ.nwb")
+    registry.register_file(
+        sha256="10" * 32,
+        size_bytes=10,
+        spyglass_name="guard_.nwb",
+        file_class="raw",
+        owner=uploader,
+        rules=(),  # private
+    )
+    derivative = registry.register_file(
+        sha256="11" * 32,
+        size_bytes=10,
+        spyglass_name="guard_ABCDEFGHIJ.nwb",
+        file_class="analysis",
+        owner=uploader,
+        inherit_if_parent=True,
+    )
+
+    attacker = _second_account(8010, "name-squatter")
+    registry.register_file(
+        sha256="12" * 32,
+        size_bytes=10,
+        spyglass_name="guard_.nwb",  # the raw's name, as an analysis file
+        file_class="analysis",
+        owner=attacker,
+        rules=rules_for(Scope.PUBLIC),
+    )
+
+    r = _client().get(
+        f"/api/v1/file/{derivative.file_id}/content",
+        headers={"Authorization": f"Bearer {registry.issue_token(attacker)}"},
+        follow_redirects=False,
+    )
+
+    assert r.status_code == 403
+
+
+def test_a_raw_registered_after_the_derivative_grants_nothing(
+    db, uploader, nwbfile_tables
+):
+    """A derivative can exist before anyone registers its raw.
+
+    `ContentConflict` only binds a name once a first raw registration exists,
+    so without the timestamp check a stranger could claim the name afterwards,
+    publicly, and inherit the derivatives already pointing at it.
+    """
+    from spyglass_store import registry
+    from spyglass_store.access import Scope, rules_for
+
+    _declare_lineage(nwbfile_tables, "late_.nwb", "late_ABCDEFGHIJ.nwb")
+    derivative = registry.register_file(
+        sha256="13" * 32,
+        size_bytes=10,
+        spyglass_name="late_ABCDEFGHIJ.nwb",
+        file_class="analysis",
+        owner=uploader,
+        inherit_if_parent=True,
+    )
+
+    latecomer = _second_account(8020, "latecomer")
+    claimed = registry.register_file(
+        sha256="14" * 32,
+        size_bytes=10,
+        spyglass_name="late_.nwb",
+        file_class="raw",
+        owner=latecomer,
+        rules=rules_for(Scope.PUBLIC),
+    )
+    # Explicitly later: these timestamps have one-second resolution, and a
+    # registration made in the same second as the derivative is deliberately
+    # allowed. What must not work is taking the name afterwards.
+    _, File, _ = registry.tables()
+    File.update1(
+        {
+            "file_id": claimed.file_id,
+            "registered": derivative.registered + timedelta(seconds=5),
+        }
+    )
+
+    r = _client().get(
+        f"/api/v1/file/{derivative.file_id}/content",
+        headers={"Authorization": f"Bearer {registry.issue_token(latecomer)}"},
+        follow_redirects=False,
+    )
+
+    assert r.status_code == 403, "the raw appeared after the derivative did"
+
+
+def test_quota_records_the_stored_size_not_the_declared_one(
+    db, uploader, nwbfile_tables
+):
+    """`usage_since` totals these rows, so a declared size would set the quota.
+
+    An uploader could otherwise register one byte for a huge object and make
+    every later read of it nearly free.
+    """
+    from fastapi.testclient import TestClient
+
+    from spyglass_store import registry
+    from spyglass_store.access import Scope, rules_for
+    from spyglass_store.app import create_app
+    from spyglass_store.settings import Settings
+
+    file = registry.register_file(
+        sha256="15" * 32,
+        size_bytes=1,  # the lie
+        spyglass_name="liar_.nwb",
+        file_class="raw",
+        owner=uploader,
+        rules=rules_for(Scope.PUBLIC),
+    )
+
+    class _BigStore:
+        def exists(self, key):
+            return True
+
+        def size(self, key):
+            return 10 * 1024**3
+
+        def presigned_get(self, key, ttl):
+            return "https://objects.example.org/signed"
+
+    client = TestClient(
+        create_app(store=_BigStore(), github=object(), settings=Settings())
+    )
+    client.get(
+        f"/api/v1/file/{file.file_id}/content",
+        headers={"Authorization": f"Bearer {registry.issue_token(uploader)}"},
+        follow_redirects=False,
+    )
+
+    assert registry.usage_since(uploader, 24).total_bytes == 10 * 1024**3
+
+
+def test_empty_content_can_still_be_claimed(db, uploader, nwbfile_tables):
+    """A zero-byte object has no range to challenge over.
+
+    `proof_challenge` would ask for `bytes=0-0` of an empty object, which the
+    store refuses — so a second owner could never deduplicate empty content.
+    """
+    import hashlib
+
+    from fastapi.testclient import TestClient
+
+    from spyglass_store import registry
+    from spyglass_store.app import create_app
+    from spyglass_store.settings import Settings
+
+    empty = hashlib.sha256(b"").hexdigest()
+
+    class _EmptyObject:
+        def exists(self, key):
+            return True
+
+        def size(self, key):
+            return 0
+
+        def read_range(self, key, offset, length):  # pragma: no cover
+            raise AssertionError("an empty object must not be challenged")
+
+        def presigned_put(self, key, ttl, sha256=None, content_md5=None):
+            from spyglass_store.storage import PresignedUpload
+
+            return PresignedUpload("", {})
+
+    other = _second_account(8030, "second-owner-of-nothing")
+    client = TestClient(
+        create_app(store=_EmptyObject(), github=object(), settings=Settings())
+    )
+
+    r = client.post(
+        "/api/v1/file",
+        json={
+            "sha256": empty,
+            "size_bytes": 0,
+            "spyglass_name": "empty_.nwb",
+            "file_class": "raw",
+            "content_md5": hashlib.md5(b"").hexdigest(),
+        },
+        headers={"Authorization": f"Bearer {registry.issue_token(other)}"},
+    )
+
+    assert r.status_code == 201

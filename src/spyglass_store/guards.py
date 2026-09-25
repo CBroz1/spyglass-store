@@ -16,7 +16,7 @@ about HTTP.
 from __future__ import annotations
 
 import secrets
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from fastapi import HTTPException, Request, status
 
@@ -64,11 +64,12 @@ def _readable(request: Request, file: registry.FileRecord, identity: Identity):
     parent is always a raw file and a raw file never has one — there is no chain
     to walk and no cycle to guard against.
 
-    The parent is a name, and every registration of a raw name holds the same
-    content (`registry.ContentConflict`), so "may read the raw" is the union
-    over those registrations rather than a choice between rival rows. Without
-    that rule this would be a way to read other people's derivatives: register
-    the raw's name against bytes of your own, declare it public, inherit.
+    The parent is a name, so what counts as "the raw" has to be something a
+    stranger cannot arrange: `registrations_of_parent` takes only *raw*
+    registrations that predate this file, and `registry.ContentConflict` keeps
+    them agreeing about content. Relax any of the three and this becomes a way
+    to read other people's results — claim the name, declare it public,
+    inherit.
 
     Costs an extra query, and only when the direct check has already failed and
     the file has a parent.
@@ -86,7 +87,9 @@ def _readable(request: Request, file: registry.FileRecord, identity: Identity):
 
     return any(
         may_read(reg.rules_for_file(raw.file_id), reader, raw.owner)
-        for raw in reg.registrations_of_parent(parent)
+        for raw in reg.registrations_of_parent(
+            parent, before=getattr(file, "registered", None)
+        )
     )
 
 
@@ -123,6 +126,7 @@ def _authorize(
     file: registry.FileRecord,
     identity: Identity,
     action: str,
+    store=None,
 ) -> None:
     """Raise 403 unless `identity` may read `file`, recording either outcome.
 
@@ -140,6 +144,11 @@ def _authorize(
         The caller.
     action : str
         Log action: resolve or read.
+    store : ObjectStore, optional
+        Consulted for the object's true size when a read is granted. Required
+        for `read`: quota is summed from these rows, so logging the declared
+        size would let an uploader register one byte for a huge object and make
+        every later read of it nearly free.
 
     Raises
     ------
@@ -149,14 +158,20 @@ def _authorize(
     reg = request.app.state.registry
     permitted = _readable(request, file, identity)
 
+    # Charged only when a URL is actually issued; a refusal transfers nothing,
+    # and counting it would inflate quota against the wrong user. The size is
+    # the store's, not the uploader's: `usage_since` totals these rows, so a
+    # declared size here would be a quota the uploader sets themselves.
+    charged = 0
+    if permitted and action == "read":
+        charged = _charged_size(store, file) if store else file.size_bytes
+
     reg.log_access(
         identity=identity,
         action=action,
         granted=permitted,
         file_id=file.file_id,
-        # Charged only when a URL is actually issued; a refusal transfers
-        # nothing, and counting it would inflate quota against the wrong user.
-        size_bytes=file.size_bytes if permitted and action == "read" else 0,
+        size_bytes=charged,
         source_ip=client_ip(request),
     )
 
@@ -247,10 +262,13 @@ def _enforce_quota(
     # When the oldest counted read ages out, capacity returns. Saying so beats
     # a fixed interval that has every client retry at the same moment.
     retry = window.total_seconds()
-    if usage.earliest is not None:
-        retry = max(
-            1, (usage.earliest + window - datetime.now()).total_seconds()
-        )
+    if usage.earliest is not None and usage.asof is not None:
+        # Both timestamps come from the database, in one reading. The broker's
+        # own clock is naive and local, so mixing the two would slide
+        # Retry-After by whatever the hosts disagree by — and asking the
+        # database here would mean reaching past the registry this layer is
+        # given, which is the seam the whole route layer is tested through.
+        retry = max(1, (usage.earliest + window - usage.asof).total_seconds())
 
     reg.log_access(
         identity=identity,
@@ -330,6 +348,14 @@ def _require_possession(
         return  # they can already have these bytes
 
     size = store.size(key) or 0
+
+    if size == 0:
+        # Nothing to sample, and nothing to prove: empty content is held by
+        # anyone who can name it. Challenging it would ask for `bytes=0-0` of a
+        # zero-length object, which the store refuses — so a second owner could
+        # never deduplicate empty content at all.
+        return
+
     challenge = proof_challenge(identity.account_id, body.sha256, size)
 
     if not body.possession_proof:

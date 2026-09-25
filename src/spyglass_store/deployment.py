@@ -21,6 +21,16 @@ from spyglass_store.lab import verify_lab_schema
 from spyglass_store.nwbfile import verify_nwbfile_schema
 from spyglass_store.settings import Settings
 
+#: A scheme's port, for URLs that leave it out. `https://a.org` and
+#: `https://a.org:443` are one origin, and comparing `None` to `443` would say
+#: otherwise — suppressing the warning in exactly the configuration it is for.
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _port(parts) -> int | None:
+    """Return a URL's port, explicit or implied by its scheme."""
+    return parts.port or _DEFAULT_PORTS.get(parts.scheme)
+
 
 def same_origin(first: str, second: str) -> bool:
     """Return True if two URLs share a scheme, host, and port.
@@ -35,16 +45,18 @@ def same_origin(first: str, second: str) -> bool:
     True
     >>> same_origin("https://a.org", "https://objects.a.org")
     False
+    >>> same_origin("https://a.org", "https://a.org:443/objects")
+    True
     """
     if not first or not second:
         return False
 
     one, two = urlsplit(first), urlsplit(second)
 
-    return (one.scheme, one.hostname, one.port) == (
+    return (one.scheme, one.hostname, _port(one)) == (
         two.scheme,
         two.hostname,
-        two.port,
+        _port(two),
     )
 
 

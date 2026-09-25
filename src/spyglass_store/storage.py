@@ -245,6 +245,16 @@ class ObjectStore(Protocol):
     SeaweedFS, and Garage is meant to stay reversible.
     """
 
+    def verify_store(self) -> None:
+        """Raise if the bucket cannot be reached with these credentials.
+
+        Called once at startup. Declared here because `verify_deployment`
+        calls it on whatever adapter it is handed — without it, an alternative
+        implementation satisfies this protocol and then fails the boot with an
+        `AttributeError` instead of a message naming the bucket.
+        """
+        ...
+
     def exists(self, key: str) -> bool:
         """Return True if an object is present at `key`."""
         ...

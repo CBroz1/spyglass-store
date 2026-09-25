@@ -82,8 +82,11 @@ services:
       # every download fails at the redirect.
       - "9000:8080"
     healthcheck:
-      # RGW has no liveness endpoint, so the S3 API itself is the probe.
-      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8080/"]
+      # RGW has no liveness endpoint, so the S3 API itself is the probe — and
+      # any HTTP answer means it is serving. Not `-f`: an anonymous GET of the
+      # service root is commonly 403, which would leave the store unhealthy
+      # forever and the broker never started.
+      test: ["CMD", "curl", "-sS", "-o", "/dev/null", "http://localhost:8080/"]
       interval: 10s
       timeout: 5s
       retries: 30
@@ -121,8 +124,16 @@ services:
       # Identity. Register an app per deployment; see docs/src/github-app.md.
       SPYGLASS_STORE_GITHUB_CLIENT_ID: ${SPYGLASS_STORE_GITHUB_CLIENT_ID:?}
 
-      # Object store. `store` is the service name on the compose network, so
-      # this is a different origin from whatever the broker is published at.
+      # Object store.
+      #
+      # **This address is signed into every presigned URL**, so it has to be
+      # one the *client* can reach, not only one the broker can. The default
+      # below is the compose service name, which works for a client on this
+      # network and for nothing else — a laptop following a redirect to
+      # `http://store:8080` cannot resolve it.
+      #
+      # For anything beyond a single-host trial, set this to the address
+      # clients use and make sure the broker can reach the same one.
       SPYGLASS_STORE_S3_ENDPOINT_URL: ${SPYGLASS_STORE_S3_ENDPOINT_URL:-http://store:8080}
       SPYGLASS_STORE_S3_BUCKET: ${SPYGLASS_STORE_S3_BUCKET:-spyglass-store}
       SPYGLASS_STORE_S3_ACCESS_KEY: ${SPYGLASS_STORE_S3_ACCESS_KEY:?}

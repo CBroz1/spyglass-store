@@ -22,6 +22,9 @@ PAYLOAD = b"synthetic raw session bytes\n"
 #: whatever hash was registered, so a stand-in value is rejected — which is
 #: the point, and which these tests would otherwise paper over.
 SHA = hashlib.sha256(PAYLOAD).hexdigest()
+#: Required here, because the store under test does not verify the sha256
+#: checksum — see `Settings.s3_store_verifies_sha256`.
+MD5 = hashlib.md5(PAYLOAD).hexdigest()
 NAME = "minirec20230622_.nwb"
 
 
@@ -102,6 +105,7 @@ def test_upload_then_stream(client, accounts, object_store):
         "/api/v1/file",
         json={
             "sha256": SHA,
+            "content_md5": MD5,
             "size_bytes": len(PAYLOAD),
             "spyglass_name": NAME,
             "file_class": "raw",
@@ -155,6 +159,7 @@ def test_a_non_member_is_refused_the_same_file(client, accounts):
         "/api/v1/file",
         json={
             "sha256": SHA,
+            "content_md5": MD5,
             "size_bytes": len(PAYLOAD),
             "spyglass_name": NAME,
             "file_class": "raw",
@@ -184,6 +189,7 @@ def test_re_registering_the_same_bytes_skips_the_upload(client, accounts):
 
     body = {
         "sha256": SHA,
+        "content_md5": MD5,
         "size_bytes": len(PAYLOAD),
         "spyglass_name": NAME,
         "file_class": "raw",
@@ -230,6 +236,7 @@ def test_visibility_change_takes_effect_immediately(client, accounts):
         "/api/v1/file",
         json={
             "sha256": SHA,
+            "content_md5": MD5,
             "size_bytes": len(PAYLOAD),
             "spyglass_name": NAME,
             "file_class": "raw",
@@ -288,6 +295,7 @@ def test_a_registration_awaiting_bytes_is_not_an_error(client, accounts):
         "/api/v1/file",
         json={
             "sha256": SHA,
+            "content_md5": MD5,
             "size_bytes": len(PAYLOAD),
             "spyglass_name": NAME,
             "file_class": "raw",
@@ -338,6 +346,7 @@ def test_resolve_prefers_the_callers_own_registration(client, accounts):
     """
     body = {
         "sha256": SHA,
+        "content_md5": MD5,
         "size_bytes": len(PAYLOAD),
         "spyglass_name": NAME,
         "file_class": "raw",
@@ -371,6 +380,7 @@ def test_resolving_by_hash_finds_the_callers_own_registration(client, accounts):
     """
     body = {
         "sha256": SHA,
+        "content_md5": MD5,
         "size_bytes": len(PAYLOAD),
         "spyglass_name": NAME,
         "file_class": "raw",
@@ -406,6 +416,7 @@ def test_a_private_registration_does_not_mask_a_readable_one(client, accounts):
     """
     body = {
         "sha256": SHA,
+        "content_md5": MD5,
         "size_bytes": len(PAYLOAD),
         "spyglass_name": NAME,
         "file_class": "raw",
@@ -448,6 +459,7 @@ def _register(client, accounts, who, **overrides):
     """Attempt a registration, returning the raw response."""
     body = {
         "sha256": SHA,
+        "content_md5": MD5,
         "size_bytes": len(PAYLOAD),
         "spyglass_name": f"{who}_copy_.nwb",
         "file_class": "raw",

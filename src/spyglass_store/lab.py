@@ -109,10 +109,13 @@ def lab_member_for_github(github_login: str) -> str | None:
     `github_user_name`, as it already does for `google_user_name` and
     `datajoint_user_name`.
 
-    If it is ever violated, picking a row arbitrarily would silently hand one
-    person another's teams, so the ambiguity is logged rather than resolved
-    quietly. The first row still wins, because refusing the login outright
-    would lock out a user over an administrative mistake they cannot fix.
+    If it is ever violated, this returns None — the same answer as a login
+    nobody has linked. Picking a row would hand one person another's teams and
+    tier on the strength of database ordering, which is not a decision this can
+    make correctly. Nobody is locked out: they can still log in, as an
+    unaffiliated reader with access to public files, until an admin removes the
+    duplicate. The ambiguity is logged loudly, because only an admin can fix
+    it.
 
     Parameters
     ----------
@@ -122,7 +125,8 @@ def lab_member_for_github(github_login: str) -> str | None:
     Returns
     -------
     str or None
-        The `lab_member_name`, or None when the login is not linked to one.
+        The `lab_member_name`, or None when the login is linked to no member —
+        or to more than one, which is the same answer for a different reason.
         None is normal, not an error: an unaffiliated reader holds a broker
         account with no lab membership.
     """
@@ -133,14 +137,17 @@ def lab_member_for_github(github_login: str) -> str | None:
 
     if len(names) > 1:
         logging.getLogger(__name__).warning(
-            "GitHub login %r is recorded against %d lab members (%s). It "
-            "should map to at most one; add a unique index on "
-            "github_user_name. Using %r.",
+            "GitHub login %r is recorded against %d lab members (%s). It must "
+            "map to at most one; add a unique index on github_user_name. "
+            "Treating the login as unaffiliated until that is fixed — "
+            "granting one of these members' teams on the strength of row "
+            "order would hand someone another person's access.",
             github_login,
             len(names),
             ", ".join(sorted(str(name) for name in names)),
-            names[0],
         )
+
+        return None
 
     return names[0] if len(names) else None
 

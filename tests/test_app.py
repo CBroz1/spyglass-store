@@ -353,6 +353,9 @@ BODY = {
     "size_bytes": 512,
     "spyglass_name": "new_.nwb",
     "file_class": "raw",
+    # Required unless the store verifies the sha256 checksum, which the
+    # default settings say it does not.
+    "content_md5": "b" * 32,
 }
 
 
@@ -730,3 +733,52 @@ def test_info_asks_for_sha256_alone_when_the_store_checks_it(store, reg):
 def test_info_needs_a_token(client):
     """It describes the deployment, and an anonymous caller has no upload."""
     assert client.get("/api/v1/info").status_code == 401
+
+
+def test_retry_after_needs_no_database(client, reg, store):
+    """The quota refusal must work through the injected registry alone.
+
+    `Retry-After` is computed from the window the registry reported, not from a
+    clock this layer asks for itself — so the whole route layer stays runnable
+    against an in-memory registry, which is what every test in this file does.
+    A direct database call here would only fail once someone exceeded a quota.
+    """
+    from datetime import datetime, timedelta
+
+    from spyglass_store.registry import Usage
+    from spyglass_store.settings import Settings
+
+    now = datetime(2026, 1, 2, 3, 4, 5)
+    reg.rules = (AccessRule(Principal.PUBLIC),)
+    reg.usage_since = lambda account_id, hours, action="read": Usage(
+        total_bytes=10**15,
+        earliest=now - timedelta(hours=23),
+        files=frozenset(),
+        asof=now,
+    )
+
+    from fastapi.testclient import TestClient
+
+    from spyglass_store.app import create_app
+
+    throttled = TestClient(
+        create_app(
+            verifier=_Verifier(),
+            store=store,
+            github=object(),
+            registry_module=reg,
+            settings=Settings(
+                download_tb_per_day=1 / 1024**4, quota_window_hours=24
+            ),
+        )
+    )
+
+    r = throttled.get(
+        f"/api/v1/file/{OWNER.file_id}/content",
+        headers=auth("owner"),
+        follow_redirects=False,
+    )
+
+    assert r.status_code == 429
+    # One hour of the window is left, measured on the registry's clock.
+    assert 3500 <= int(r.headers["Retry-After"]) <= 3700

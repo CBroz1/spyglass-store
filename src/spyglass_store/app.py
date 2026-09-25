@@ -334,6 +334,25 @@ def create_app(
         except ValueError as err:  # group with no teams names nobody
             raise HTTPException(status_code=422, detail=str(err)) from err
 
+        # Where the store ignores `x-amz-checksum-sha256`, the MD5 is the only
+        # thing standing between a registration and arbitrary bytes stored
+        # under its hash. Accepting the upload without one would leave content
+        # addressing — and every access decision that rests on it — unenforced.
+        if (
+            settings.s3_enforce_upload_checksum
+            and not settings.s3_store_verifies_sha256
+            and body.content_md5 is None
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "content_md5 is required by this deployment: its object "
+                    "store does not verify the sha256 checksum, so nothing "
+                    "else would check the bytes against the hash they are "
+                    "stored under. GET /info lists the digests to send."
+                ),
+            )
+
         _enforce_quota(
             request,
             identity,
@@ -470,7 +489,7 @@ def create_app(
         # would count this file against itself, and would charge an account
         # for a request the next line then refuses.
         _enforce_quota(request, identity, file, settings, app.state.store)
-        _authorize(request, file, identity, "read")
+        _authorize(request, file, identity, "read", store=app.state.store)
 
         url = app.state.store.presigned_get(
             object_key(file.sha256), settings.presigned_ttl_seconds

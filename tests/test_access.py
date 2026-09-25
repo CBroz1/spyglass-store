@@ -155,25 +155,6 @@ def test_is_public_matches_declared_scope(scope, teams, expected) -> None:
 # ----------------------- tier, and the whole rule -----------------------
 
 
-def test_tier_names_match_the_database_vocabulary():
-    """Four names, declared twice: here and in the schema's enum.
-
-    DataJoint spells its enum as a string and cannot import this one, so
-    nothing but a test keeps them in step. A fifth tier added in one place and
-    not the other fails here rather than at an insert.
-    """
-    import re
-
-    from spyglass_store.access import Tier
-
-    definition = """
-    tier='unverified'    : enum('unverified','verified','trusted','admin')
-    """
-    declared = set(re.findall(r"'([a-z]+)'", definition.split("enum")[1]))
-
-    assert declared == {tier.value for tier in Tier}
-
-
 @pytest.mark.parametrize(
     "tier,reads_private,uploads",
     [

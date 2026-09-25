@@ -128,7 +128,12 @@ class VisibilityOut(BaseModel):
 
 
 class PossessionRequired(BaseModel):
-    """What a caller must answer to claim content already in the store."""
+    """What a caller must answer to claim content already in the store.
+
+    The body of a 428, nested under `detail` as every error here is —
+    `openapi.yaml` describes that envelope. `guards._require_possession`
+    builds the same fields; this is what the contract is generated against.
+    """
 
     detail: str
     sha256: str

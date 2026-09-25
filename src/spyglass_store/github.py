@@ -129,12 +129,17 @@ class GitHub:
             expires_in=int(payload.get("expires_in", 900)),
         )
 
-    def poll(self, device_code: str) -> str:
+    def poll(self, device_code: str, interval: int = 5) -> str:
         """Exchange an approved device code for a GitHub token.
 
         Parameters
         ----------
         device_code : str
+            The code from `begin`.
+        interval : int, optional
+            The interval `begin` returned. Carried so a `slow_down` can raise
+            it: the spec says to add five seconds and keep the new cadence,
+            and GitHub does not reliably echo a replacement interval.
             From `begin`.
 
         Returns
@@ -165,7 +170,20 @@ class GitHub:
         error = payload.get("error", "unknown_error")
 
         if error in PENDING_ERRORS:
-            raise AuthorizationPending(int(payload.get("interval", 5)))
+            # `slow_down` is an instruction to poll five seconds slower from
+            # here on, not a one-off delay. Echoing back the same interval
+            # would keep an already-too-fast client at the cadence that earned
+            # the warning.
+            slower = interval + 5 if error == "slow_down" else interval
+
+            # The new cadence reaches the client as `Retry-After` on the
+            # broker's 428. It does not compound across polls: the broker holds
+            # no state between them, so a second `slow_down` raises the default
+            # again rather than the raised value. Enough to back off, not
+            # enough to satisfy the spec's "and subsequent requests".
+            raise AuthorizationPending(
+                int(payload.get("interval", slower) or slower)
+            )
 
         raise DeviceFlowError(f"Device flow failed: {error}")
 
@@ -186,18 +204,29 @@ class GitHub:
         DeviceFlowError
             If GitHub does not recognize the token.
         """
-        response = self._http.get(
-            USER_URL,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-            },
-        )
+        try:
+            response = self._http.get(
+                USER_URL,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                },
+            )
+        except httpx.HTTPError as err:
+            # Same translation `_post` does. Without it an unreachable GitHub
+            # escapes the login route as a 500, which reads like a broker fault
+            # and tells the user nothing about what to retry.
+            raise DeviceFlowError(f"Could not reach GitHub: {err}") from err
 
         if response.status_code != httpx.codes.OK:
             raise DeviceFlowError("GitHub did not recognize the token.")
 
-        body = response.json()
+        try:
+            body = response.json()
+        except ValueError as err:
+            raise DeviceFlowError(
+                "GitHub returned a response that was not JSON."
+            ) from err
 
         return GitHubUser(
             github_id=body["id"],

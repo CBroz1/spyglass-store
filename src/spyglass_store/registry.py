@@ -84,6 +84,9 @@ class FileRecord:
         Either raw or analysis.
     owner : str
         Account id that registered it.
+    registered : datetime or None
+        When the broker recorded it. Inheritance uses it to ignore a raw
+        registration that appeared after this file did.
     parent : str or None
         For an analysis file, the `spyglass_name` of the raw it was derived
         from, as recorded in Spyglass's `AnalysisNwbfile`. None for a raw file,
@@ -104,6 +107,7 @@ class FileRecord:
     owner: str
     parent: str | None = None
     inherits: bool = False
+    registered: datetime | None = None
 
 
 def _schema():
@@ -144,6 +148,7 @@ def _record(row: dict | None) -> FileRecord | None:
         owner=str(row["owner"]),
         parent=row.get("parent"),
         inherits=bool(row.get("inherits", False)),
+        registered=row.get("registered"),
     )
 
 
@@ -228,24 +233,58 @@ def files_by_sha256(sha256: str) -> tuple[FileRecord, ...]:
 
 
 @serialized
-def registrations_of_parent(parent: str) -> tuple[FileRecord, ...]:
-    """Return every registration of the raw an analysis file derives from.
+def registrations_of_parent(
+    parent: str, before: datetime | None = None
+) -> tuple[FileRecord, ...]:
+    """Return the raw registrations an analysis file may inherit from.
 
-    Named separately from `files_by_name` because the question is different:
-    this one is asked on the read path, about a name the *broker* recorded from
-    Spyglass rather than a name a caller supplied. Every row it returns holds
-    the same content, enforced at registration — see `ContentConflict`.
+    Two restrictions, and both are load-bearing. Inheritance lets one file's
+    audience decide another's, so what counts as "the raw" has to be something
+    a stranger cannot arrange.
+
+    **Raw registrations only.** `files_by_name` answers about a name, and an
+    *analysis* name is not content-gated — anyone may register one. Without
+    this filter, registering an analysis file under the raw's name and
+    declaring it public would hand out every derivative of that raw.
+
+    **Registered before the derivative was.** A derivative can be registered
+    before anyone registers its raw, and `ContentConflict` only binds a name
+    once a first raw registration exists. Otherwise a stranger could claim the
+    name afterwards, publicly, and inherit the derivatives already pointing at
+    it. Requiring the raw to predate the derivative matches the only honest
+    order — upload a session, then derive from it — and a derivative whose raw
+    is not there yet simply reaches nobody but its owner.
 
     Parameters
     ----------
     parent : str
         A raw file's `spyglass_name`, as recorded on `File.parent`.
+    before : datetime, optional
+        Ignore registrations newer than this. Pass the derivative's own
+        `registered` timestamp.
 
     Returns
     -------
     tuple of FileRecord
     """
-    return files_by_name(parent)
+    _, File, _ = tables()
+    query = File & {"spyglass_name": parent, "file_class": "raw"}
+
+    if before is not None:
+        # At-or-before. These timestamps have one-second resolution, so a raw
+        # registered inside the same second as the derivative cannot be ordered
+        # against it and is allowed — which is the common case, since a compute
+        # host registers a raw and its results back to back.
+        #
+        # What that leaves open is a claim placed in that same second, which an
+        # attacker can only time if they already know a derivative is being
+        # registered right then. The claim this closes is the practical one:
+        # taking the name afterwards, at leisure.
+        query = query & f"registered <= '{before:%Y-%m-%d %H:%M:%S}'"
+
+    rows = query.fetch(as_dict=True, order_by="registered DESC")
+
+    return tuple(_record(row) for row in rows)
 
 
 @serialized
@@ -426,16 +465,10 @@ def register_file(
             ]
         )
 
-    return FileRecord(
-        file_id=file_id,
-        sha256=sha256,
-        size_bytes=size_bytes,
-        spyglass_name=spyglass_name,
-        file_class=file_class,
-        owner=str(owner),
-        parent=parent,
-        inherits=inherits,
-    )
+    # Read back rather than reconstructed: the row carries a `registered`
+    # timestamp the database assigns, and inheritance compares against it. A
+    # hand-built record would differ from the stored one in exactly that field.
+    return _record(_one(File & {"file_id": file_id}))
 
 
 def token_hash(token: str) -> str:
@@ -768,11 +801,19 @@ class Usage(NamedTuple):
         Timestamp of the oldest counted read, or None if there were none.
     files : frozenset of str
         File ids already charged, so re-reading one is not charged twice.
+    asof : datetime or None
+        The database clock reading this window was measured from. Carried so a
+        caller can do arithmetic against `earliest` without asking the database
+        the time itself — the answers would be from two different readings, and
+        the caller would have to reach past the registry to get one.
+
+        Last, and defaulted, because `Usage` is constructed positionally.
     """
 
     total_bytes: int
     earliest: datetime | None
     files: frozenset[str]
+    asof: datetime | None = None
 
 
 #: One row per distinct file charged in the window, carrying the window's
@@ -852,24 +893,28 @@ def usage_since(
     Usage
     """
     AccessLog = _access_log()
+    # One reading of the database clock, used both to bound the window and to
+    # tell the caller what "now" was while it was measured.
+    now = db_now()
 
     rows = (
         dj.conn()
         .query(
             _USAGE_SQL.format(table=AccessLog.full_table_name),
-            (int(account_id), action, window_start(window_hours)),
+            (int(account_id), action, now - timedelta(hours=window_hours)),
             as_dict=True,
         )
         .fetchall()
     )
 
     if not rows:
-        return Usage(0, None, frozenset())
+        return Usage(0, None, frozenset(), now)
 
     return Usage(
         total_bytes=int(rows[0]["total_bytes"]),
         earliest=rows[0]["earliest"],
         files=frozenset(row["file_id"] for row in rows),
+        asof=now,
     )
 
 

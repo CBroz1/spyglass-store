@@ -29,3 +29,12 @@ map $scheme $hsts_header {
     https   "max-age=31536000";
     default "";
 }
+
+# Retry-After only on the 429 this edge generates. Sent unconditionally it
+# lands on successful device-code and token responses too, where a client that
+# honours it would wait a minute before its first poll instead of using the
+# interval GitHub returned.
+map $status $retry_after {
+    429     "${SPYGLASS_STORE_EDGE_RETRY_AFTER}";
+    default "";
+}

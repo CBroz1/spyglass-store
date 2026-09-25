@@ -206,10 +206,17 @@ paths:
             knew a digest could claim the content behind it and share it
             onward — and revoking the original visibility would not take it
             back.
+
+            The challenge is nested under `detail`, which is how this service
+            reports every error.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/PossessionChallenge"
+                type: object
+                required: [detail]
+                properties:
+                  detail:
+                    $ref: "#/components/schemas/PossessionChallenge"
         "429":
           $ref: "#/components/responses/Throttled"
 

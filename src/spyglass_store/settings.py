@@ -22,7 +22,7 @@ of the broker's environment is the reason this is a separate repository.
 
 from __future__ import annotations
 
-import os
+import sys
 from functools import lru_cache
 
 from pydantic import Field
@@ -37,13 +37,17 @@ class Settings(BaseSettings):
     *not* here; see the module docstring.
     """
 
-    # `.env` is deliberately not read under pytest. Otherwise any code path
+    # `.env` is deliberately not read under pytest: otherwise any code path
     # reaching `get_settings()` picks up whatever `.env` happens to sit in the
-    # working directory, and the suite's behaviour becomes machine-dependent.
-    # Tests that want configuration construct `Settings(...)` explicitly.
+    # working directory, and the suite becomes machine-dependent. Tests that
+    # want configuration construct `Settings(...)` explicitly.
+    #
+    # Keyed on pytest being imported, not on `PYTEST_CURRENT_TEST`, which is set
+    # per test — this class is defined at import time, during collection, when
+    # that variable does not exist yet and the guard silently did nothing.
     model_config = SettingsConfigDict(
         env_prefix="SPYGLASS_STORE_",
-        env_file=None if "PYTEST_CURRENT_TEST" in os.environ else ".env",
+        env_file=None if "pytest" in sys.modules else ".env",
         extra="ignore",
     )
 
